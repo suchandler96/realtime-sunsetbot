@@ -1,0 +1,300 @@
+import argparse
+import math
+import os
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
+
+from solar import sun_event
+from weather_data import DataSource, WeatherData
+from cities import get_city, CITIES
+from satellite import get_source, SOURCES
+import fy4b
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line query options."""
+    parser = argparse.ArgumentParser(
+        description="Plot an atmosphere cross-section near sunrise/sunset."
+    )
+    parser.add_argument("--city", default="Shanghai", choices=[c.name for c in CITIES],
+                        help="city name from cities.py")
+    parser.add_argument("--date", default="2026-09-13", help="local date YYYY-MM-DD")
+    parser.add_argument("--event", default="sunrise", choices=["sunrise", "sunset"],
+                        help="which solar event to plot")
+    parser.add_argument("--data-source", default=DataSource.GFS.name,
+                        choices=[s.name for s in DataSource], help="weather model")
+    parser.add_argument("--cloud-base", type=float, default=-1,
+                        help="manual cloud base height in km")
+    parser.add_argument("--satellite", action=argparse.BooleanOptionalAction, default=False,
+                        help="include a satellite cloud-top layer in the figure")
+    parser.add_argument("--satellite-source", default="himawari",
+                        choices=list(SOURCES.keys()),
+                        help="satellite source: himawari -> cloud-top temperature, fy4b -> cloud-top height")
+    parser.add_argument("--satellite-file", default="",
+                        help="optional local satellite .nc file (skip download/auto-detect if provided)")
+    parser.add_argument("--cpd-file", default="",
+                        help="optional local FY-4B CPD .nc file (cloud optical thickness); "
+                             "with --satellite-source fy4b and --satellite-file this adds the cloud-products transect figure")
+    parser.add_argument("--save", action=argparse.BooleanOptionalAction, default=False,
+                        help="save the figure to a PNG file")
+    return parser.parse_args()
+
+
+# ==================== 1. 核心参数配置 ====================
+args = parse_args()
+city = get_city(args.city)
+R_EARTH_EQUATOR = 6378.1370
+R_EARTH_POLAR = 6356.7523
+
+a_cos_phi_sq = (R_EARTH_EQUATOR * np.cos(np.radians(city.latitude))) ** 2
+b_sin_phi_sq = (R_EARTH_POLAR * np.sin(np.radians(city.latitude))) ** 2
+R_EARTH = np.sqrt((R_EARTH_EQUATOR**2 * a_cos_phi_sq + R_EARTH_POLAR**2 * b_sin_phi_sq) /
+                  (a_cos_phi_sq + b_sin_phi_sq))
+HA_KM = 1.0               # 气溶胶最低透光高度 (km)，可调整
+
+# 云底高度模式：True 为自动识别，False 为手动指定 MANUAL_CBH_KM
+AUTO_CLOUD_BASE = args.cloud_base < 0
+MANUAL_CBH_KM = args.cloud_base
+
+# 观测日期与事件
+DATE = args.date
+EVENT = args.event
+TIMEZONE = city.timezone
+
+# 数据源
+DATA_SOURCE = DataSource.__members__[args.data_source]
+
+# 卫星云顶层开关与数据源
+INCLUDE_SATELLITE = args.satellite
+SATELLITE_SOURCE = args.satellite_source
+SATELLITE_FILE = args.satellite_file
+CPD_FILE = args.cpd_file
+
+# 是否保存图片
+SAVE_FIGURE = args.save
+
+# 模型数据更新时间估算 (UTC 起报时刻)。
+# Open-Meteo 标准 forecast 接口不直接返回起报时刻，这里按当前时间与模型循环周期估算。
+MODEL_CYCLE_HOURS = {DataSource.GFS: 6, DataSource.ECMWF: 12, DataSource.JMA_MSM: 3,
+                     DataSource.CMA_GFS: 6}
+MODEL_RUN_DELAY_HOURS = {DataSource.GFS: 5, DataSource.ECMWF: 9, DataSource.JMA_MSM: 2,
+                         DataSource.CMA_GFS: 6}
+
+
+def latest_model_run(source):
+    """估算当前可用的最新模型起报时刻 (UTC)。"""
+    available = datetime.now(timezone.utc) - timedelta(hours=MODEL_RUN_DELAY_HOURS[source])
+    cycle = MODEL_CYCLE_HOURS[source]
+    run_hour = available.hour - (available.hour % cycle)
+    return available.replace(hour=run_hour, minute=0, second=0, microsecond=0)
+
+
+DATA_UPDATE_STR = latest_model_run(DATA_SOURCE).strftime("%Y%m%d%H") + "z"
+
+# 计算日出/日落时间、太阳方位角与仰角
+sun = sun_event(city.latitude, city.longitude, DATE, EVENT, TIMEZONE)
+AZIMUTH = sun.position.azimuth
+SUN_ELEVATION = sun.position.geometric_elevation  # 负值表示太阳在地平线以下
+
+# 空间跨度配置：从 -100km 到 900km
+X_MIN, X_MAX = -100, 900
+STEP_KM = 20
+
+distances = np.arange(X_MIN, X_MAX + STEP_KM, STEP_KM)
+
+# 垂直气压层与对应的大致海拔高度 (米)
+PRESSURE_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200, 150, 100]
+ALTITUDES_KM = [0.1, 0.2, 0.4, 0.6, 0.8, 1.5, 2.0, 3.0, 4.2, 5.6, 7.2, 9.2, 10.4, 11.8, 13.6, 16.2]
+
+# 相对湿度色标 (与 ExampleProfile.png 一致)
+RH_BOUNDS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99, 100]
+RH_COLORS = [
+    "#E6D2C7", "#ECDDD6", "#F2EAE7", "#F9F5F2", "#FFFFFF",
+    "#E6F0E7", "#D3E6D3", "#C3DCC9", "#97BEAB", "#9FD6DD",
+    "#8BC1DD", "#6DA3D2",
+]
+
+# ==================== 2. 采样点地理坐标计算 ====================
+def get_point_at_distance(lat, lon, dist_km, azimuth):
+    R = R_EARTH
+    bearing = math.radians(azimuth)
+    d_r = dist_km / R
+    lat1, lon1 = math.radians(lat), math.radians(lon)
+
+    lat2 = math.asin(math.sin(lat1) * math.cos(d_r) + math.cos(lat1) * math.sin(d_r) * math.cos(bearing))
+    lon2 = lon1 + math.atan2(math.sin(bearing) * math.sin(d_r) * math.cos(lat1), math.cos(d_r) - math.sin(lat1) * math.sin(lat2))
+    return math.degrees(lat2), math.degrees(lon2)
+
+lats, lons = [], []
+for d in distances:
+    pt_lat, pt_lon = get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH)
+    lats.append(pt_lat)
+    lons.append(pt_lon)
+
+# ==================== 3. 请求气象数据 (相对湿度与云量) ====================
+print(
+    f"正在获取 {DATE} {EVENT} 的相对湿度与云量剖面 "
+    f"({DATA_SOURCE.value}, az={AZIMUTH:.1f}°, elev={SUN_ELEVATION:.2f}°) ..."
+)
+weather = (
+    WeatherData.source(DATA_SOURCE)
+    .coordinates(lats, lons)
+    .pressure_levels(PRESSURE_LEVELS)
+    .relative_humidity()
+    .cloud_cover()
+    .temperature()
+    .timezone(TIMEZONE)
+    .on(DATE)
+    .fetch()
+)
+
+print(f"Computed {EVENT} time: {sun.time:%Y-%m-%d %H:%M:%S %Z}")
+
+# 选择距离日出/日落时刻最近的小时
+time_idx = weather.nearest_index(sun.time)
+
+# 3.1 本地(x=0)云底高度
+if AUTO_CLOUD_BASE:
+    # 自动识别：取首个相对湿度饱和或云量明显的层结
+    obs_idx = np.where(distances == 0)[0][0]
+    rh_at_observer = weather.values("relative_humidity")[:, obs_idx, time_idx]
+    cloud_at_observer = weather.values("cloud_cover")[:, obs_idx, time_idx]
+
+    cloud_layer_mask = (rh_at_observer >= 80) | (cloud_at_observer >= 50)
+    if np.any(cloud_layer_mask):
+        local_cbh_km = ALTITUDES_KM[int(np.argmax(cloud_layer_mask))]
+    else:
+        local_cbh_km = 6.0  # 晴空无云时，默认设定一个高空火烧云幕布高度
+else:
+    local_cbh_km = MANUAL_CBH_KM
+
+# 3.2 相对湿度、云量与温度矩阵 [高度层, 距离点]，取距离日出/日落最近时次
+rh_matrix = weather.values("relative_humidity")[:, :, time_idx]
+cloud_matrix = weather.values("cloud_cover")[:, :, time_idx]
+temp_matrix = weather.values("temperature")[:, :, time_idx]
+
+# 3.3 卫星云顶信息：通过 SATELLITE_SOURCE 选择数据源，并沿剖面采样 (可选)
+cloud_top_temp_c = None
+cloud_top_alt_km = None
+if INCLUDE_SATELLITE:
+    satellite_source = get_source(SATELLITE_SOURCE)
+    cloud_top = satellite_source.read_cloud_top(sun.time, lats, lons, local_file=SATELLITE_FILE)
+    cloud_top_temp_c = cloud_top.temperature_c
+    cloud_top_alt_km = cloud_top.altitude_km
+
+# ==================== 4. 绘制剖面图与模拟光路 ====================
+fig, ax = plt.subplots(figsize=(14, 6), dpi=120)
+
+# 4.1 绘制相对湿度背景色 (与 ExampleProfile.png 色标一致)
+X, Y = np.meshgrid(distances, ALTITUDES_KM)
+rh_cmap = ListedColormap(RH_COLORS)
+rh_norm = BoundaryNorm(RH_BOUNDS, rh_cmap.N)
+contour = ax.contourf(X, Y, rh_matrix, levels=RH_BOUNDS, cmap=rh_cmap, norm=rh_norm)
+cbar = fig.colorbar(contour, ax=ax, ticks=RH_BOUNDS)
+cbar.set_label('Relative Humidity (%)', fontsize=11)
+
+# 4.1b 叠加云量：云量 >= 50% 的区域以斜线阴影表示，低云也能显示出来
+ax.contourf(X, Y, cloud_matrix, levels=[50, 101], colors='none', hatches=['///'])
+ax.contour(X, Y, cloud_matrix, levels=[50], colors='dimgray', linewidths=0.6, alpha=0.7)
+
+# 4.1c 叠加等温线 (每隔 5°C)
+temp_levels = np.arange(-80, 31, 5)
+temp_contour = ax.contour(X, Y, temp_matrix, levels=temp_levels, colors='black', linewidths=0.7)
+ax.clabel(temp_contour, inline=True, fontsize=8, fmt='%d°C')
+
+# 4.1d 卫星云顶温度代理 (Himawari tbb_14) 沿剖面
+cloud_top_line = None
+if cloud_top_temp_c is not None:
+    ax2 = ax.twinx()
+    (cloud_top_line,) = ax2.plot(
+        distances, cloud_top_temp_c, color='navy', marker='o', markersize=2.5,
+        linewidth=1.2, label='Cloud-top temp proxy (°C)',
+    )
+    ax2.set_ylabel('Cloud-top temp proxy (°C)', fontsize=11)
+    ax2.set_ylim(-90, 40)
+
+# 4.1e FY-4B 云顶高度沿剖面
+if cloud_top_alt_km is not None:
+    ax.plot(distances, cloud_top_alt_km, color='darkgreen',
+            marker='s', markersize=3, linewidth=1.5,
+            label='FY-4B cloud-top height (km)')
+
+# 4.2 计算并绘制两条边界光路 (光线追踪)
+# 展平坐标系：x 为沿地表朝向太阳的距离 (km)，y 为海拔高度 (km)。
+# 两条光线都经过观测者头顶的云底 (x=0, y=h)，分别代表最早和最晚还能照到云底的光线。
+sun_side_x = distances[distances >= 0]  # 只绘制朝向太阳的一侧 (x >= 0)
+
+
+def earliest_light_y(x, h):
+    """最早能照到云底的光线：与地表 (半径 R) 相切，并经过 (0, h)。"""
+    s = x / R_EARTH
+    return h + 0.5 * (R_EARTH + h) * s**2 * (1.0 + 5.0 * s**2 / 12.0)
+
+
+def latest_light_y(x, h):
+    """最晚还能照到云底的光线：与气溶胶层顶 (半径 R+ha) 相切，并经过 (0, h)。"""
+    ha = min(HA_KM, h)  # 若云底低于气溶胶层顶，则最晚光线退化为与地表相切
+    theta = math.acos((R_EARTH + ha) / (R_EARTH + h))
+    s = theta - x / R_EARTH
+    return ha + (R_EARTH + ha) * 0.5 * s**2 * (1.0 + 5.0 * s**2 / 12.0)
+
+
+ax.plot(sun_side_x, earliest_light_y(sun_side_x, local_cbh_km),
+        color='darkorange', linestyle='--', linewidth=2, label='Earliest light to cloud base')
+ax.plot(sun_side_x, latest_light_y(sun_side_x, local_cbh_km),
+        color='crimson', linestyle='--', linewidth=2, label='Latest light to cloud base')
+
+# 4.3 标记核心元素
+ax.plot(0, 0, 'ro', markersize=8, label='Observer') # 观测者位置
+ax.plot(0, local_cbh_km, 'gX', markersize=10, label=f'Local Cloud Base ({local_cbh_km:.2f} km)') # 本地云底
+
+# 绘制地平线遮挡提示 (低于0km视为地下)
+ax.fill_between(distances, -1, 0, color='gray', alpha=0.3, label='Ground')
+
+# ==================== 5. 图表美化 ====================
+title = f"{DATE.replace('-', '')}_{city.name.replace(' ', '')}_{EVENT}_{DATA_SOURCE.name}_{DATA_UPDATE_STR}"
+ax.set_title(title, fontsize=14, fontweight='bold')
+ax.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
+ax.set_ylabel("Altitude (km)", fontsize=12)
+ax.set_xlim(X_MIN, X_MAX)
+ax.set_ylim(0, 16) # 对流层高度
+ax.grid(True, linestyle=':', alpha=0.5)
+handles, labels = ax.get_legend_handles_labels()
+handles.append(Patch(facecolor='none', edgecolor='dimgray', hatch='///', label='Cloud cover ≥ 50%'))
+labels.append('Cloud cover ≥ 50%')
+handles.append(Line2D([0], [0], color='black', linewidth=0.7, label='Isotherm (5°C)'))
+labels.append('Isotherm (5°C)')
+if cloud_top_line is not None:
+    handles.append(cloud_top_line)
+    labels.append('Cloud-top temp proxy (°C)')
+ax.legend(handles=handles, labels=labels, loc='lower right')
+
+plt.tight_layout()
+if SAVE_FIGURE:
+    out_path = f"{title}.png"
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    print(f"Figure saved to {out_path}")
+
+# ==================== 6. FY-4B 云参数剖面图 (native resolution) ====================
+# 卫星源选为 fy4b 且同时给出 CTH 与 CPD 文件时，额外绘制云顶高度/光学厚度剖面图。
+if SATELLITE_SOURCE == "fy4b" and SATELLITE_FILE and CPD_FILE:
+    if os.path.exists(SATELLITE_FILE) and os.path.exists(CPD_FILE):
+        companion_path = f"{title}_cloud_products.png" if SAVE_FIGURE else None
+        fy4b.plot_transect(
+            SATELLITE_FILE, CPD_FILE,
+            city.latitude, city.longitude, AZIMUTH,
+            x_min=X_MIN, x_max=X_MAX,
+            save_path=companion_path, show=False,
+        )
+        print(f"Cloud-products transect drawn from {SATELLITE_FILE} + {CPD_FILE}")
+        if companion_path:
+            print(f"Cloud-products figure saved to {companion_path}")
+    else:
+        print("Cloud-products transect skipped: satellite file(s) not found.")
+
+plt.show()

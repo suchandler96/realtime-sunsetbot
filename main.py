@@ -1,7 +1,7 @@
 import argparse
 import math
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,11 +23,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--city", default="Shanghai", choices=[c.name for c in CITIES],
                         help="city name from cities.py")
-    parser.add_argument("--date", default="2026-09-13", help="local date YYYY-MM-DD")
-    parser.add_argument("--event", default="sunrise", choices=["sunrise", "sunset"],
+    parser.add_argument("--date", default=date.today().strftime('%Y-%m-%d'), help="local date YYYY-MM-DD")
+    parser.add_argument("--event", default="sunset", choices=["sunrise", "sunset"],
                         help="which solar event to plot")
     parser.add_argument("--data-source", default=DataSource.GFS.name,
-                        choices=[s.name for s in DataSource], help="weather model")
+                        choices=[s.name for s in DataSource], help="weather model: GFS, ECMWF, JMA_MSM, CMA_GFS")
     parser.add_argument("--cloud-base", type=float, default=-1,
                         help="manual cloud base height in km")
     parser.add_argument("--satellite", action=argparse.BooleanOptionalAction, default=False,

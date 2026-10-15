@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
                              "with --satellite-source fy4b and --satellite-file this adds the cloud-products transect figure")
     parser.add_argument("--save", action=argparse.BooleanOptionalAction, default=False,
                         help="save the figure to a PNG file")
+    parser.add_argument("--silent", action=argparse.BooleanOptionalAction, default=False,
+                        help="suppress plt.show for server run")
     return parser.parse_args()
 
 
@@ -76,6 +78,7 @@ SATELLITE_FILE = args.satellite_file
 CPD_FILE = args.cpd_file
 
 # 是否保存图片
+SILENT_MODE = args.silent
 SAVE_FIGURE = args.save
 
 # 模型数据更新时间估算 (UTC 起报时刻)。
@@ -297,4 +300,5 @@ if SATELLITE_SOURCE == "fy4b" and SATELLITE_FILE and CPD_FILE:
     else:
         print("Cloud-products transect skipped: satellite file(s) not found.")
 
-plt.show()
+if not SILENT_MODE:
+    plt.show()

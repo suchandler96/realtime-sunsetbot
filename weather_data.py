@@ -39,6 +39,16 @@ class DataSource(str, Enum):
     CMA_GFS = "cma_grapes_global"
 
 
+# Geographic domain of limited-area models as (lat_min, lat_max, lon_min, lon_max)
+# in degrees.  Global models are absent from this map.  Coordinates outside a
+# model's domain are skipped rather than queried, since Open-Meteo rejects an
+# entire multi-point request if any single point is out of range.
+# jma_msm covers the JMA Mesoscale Model area around Japan.
+MODEL_DOMAIN: dict[DataSource, tuple[float, float, float, float]] = {
+    DataSource.JMA_MSM: (22.4, 47.6, 120.0, 150.0),
+}
+
+
 class WeatherBackend(ABC):
     """Transport boundary for fetching raw point payloads.
 
@@ -48,8 +58,12 @@ class WeatherBackend(ABC):
     """
 
     @abstractmethod
-    def fetch(self, request: "WeatherRequest") -> list[dict]:
-        """Return one raw response object per requested coordinate."""
+    def fetch(self, request: "WeatherRequest") -> list[dict | None]:
+        """Return one raw response object per requested coordinate.
+
+        A ``None`` entry marks a coordinate for which the model has no data
+        (for example a point outside the limited domain of ``jma_msm``).
+        """
 
 
 class OpenMeteoBackend(WeatherBackend):
@@ -57,11 +71,39 @@ class OpenMeteoBackend(WeatherBackend):
 
     _ENDPOINT = "https://api.open-meteo.com/v1/forecast"
 
-    def fetch(self, request: "WeatherRequest") -> list[dict]:
-        lat_str, lon_str = request._format_coordinates()
+    def fetch(self, request: "WeatherRequest") -> list[dict | None]:
+        latitudes = request._latitudes
+        longitudes = request._longitudes
+
+        bounds = MODEL_DOMAIN.get(request._source)
+        inside = [True] * len(latitudes)
+        if bounds is not None:
+            lat_min, lat_max, lon_min, lon_max = bounds
+            inside = [
+                lat_min <= lat <= lat_max and lon_min <= lon <= lon_max
+                for lat, lon in zip(latitudes, longitudes)
+            ]
+            if not any(inside):
+                raise RuntimeError(
+                    f"{request._source.value} has no data for any requested location "
+                    f"(model domain: {lat_min}-{lat_max}N, {lon_min}-{lon_max}E)"
+                )
+
+        if all(inside):
+            return self._as_points(self._query(request, latitudes, longitudes))
+
+        # Query the in-domain points in a single request, then scatter the
+        # responses back so out-of-domain points stay aligned as missing (None)
+        # and are simply skipped when plotting.
+        keep_lats = [lat for lat, ok in zip(latitudes, inside) if ok]
+        keep_lons = [lon for lon, ok in zip(longitudes, inside) if ok]
+        payloads = iter(self._as_points(self._query(request, keep_lats, keep_lons)))
+        return [next(payloads) if ok else None for ok in inside]
+
+    def _query(self, request: "WeatherRequest", latitudes, longitudes) -> "list[dict] | dict":
         params = {
-            "latitude": lat_str,
-            "longitude": lon_str,
+            "latitude": ",".join(f"{lat:.4f}" for lat in latitudes),
+            "longitude": ",".join(f"{lon:.4f}" for lon in longitudes),
             "hourly": ",".join(request._expanded_hourly_variables()),
             "models": request._source.value,
             "timezone": request._timezone,
@@ -73,12 +115,20 @@ class OpenMeteoBackend(WeatherBackend):
             params["forecast_days"] = request._forecast_days
 
         response = requests.get(self._ENDPOINT, params=params, timeout=30)
-        response.raise_for_status()
-        payload = response.json()
-
+        try:
+            payload = response.json()
+        except ValueError:
+            response.raise_for_status()
+            raise
+        # Open-Meteo reports domain/parameter problems as a JSON body (usually
+        # with an HTTP 400 status), so surface those before raising on status.
         if isinstance(payload, dict) and "error" in payload:
             raise RuntimeError(f"Open-Meteo error: {payload.get('reason')}")
+        response.raise_for_status()
+        return payload
 
+    @staticmethod
+    def _as_points(payload) -> list[dict]:
         # A single point is returned as an object; multiple points are a list.
         return payload if isinstance(payload, list) else [payload]
 
@@ -198,11 +248,6 @@ class WeatherRequest:
             raise ValueError("no pressure levels requested; call pressure_levels() first")
         return [f"{name}_{level}hPa" for name in self._variables for level in self._pressure_levels]
 
-    def _format_coordinates(self) -> tuple[str, str]:
-        lat_str = ",".join(f"{lat:.4f}" for lat in self._latitudes)
-        lon_str = ",".join(f"{lon:.4f}" for lon in self._longitudes)
-        return lat_str, lon_str
-
     def fetch(self) -> "WeatherResult":
         if not self._latitudes:
             raise ValueError("coordinates() must be called before fetch()")
@@ -222,19 +267,22 @@ class WeatherRequest:
 class WeatherResult:
     """Parsed multi-point, multi-level result from a `WeatherRequest`."""
 
-    def __init__(self, point_payloads: list[dict], request: WeatherRequest):
+    def __init__(self, point_payloads: list[dict | None], request: WeatherRequest):
         self.source = request._source
         self.latitudes = list(request._latitudes)
         self.longitudes = list(request._longitudes)
         self.pressure_levels = list(request._pressure_levels)
         self.variables = list(request._variables)
         self.timezone = request._timezone
-        self.times: list[str] = list(point_payloads[0]["hourly"]["time"])
+        first = next((p for p in point_payloads if p and p.get("hourly")), None)
+        if first is None:
+            raise RuntimeError("no valid point data returned by the backend")
+        self.times: list[str] = list(first["hourly"]["time"])
         self._time_objects = [datetime.fromisoformat(value) for value in self.times]
         self._arrays: dict[str, np.ndarray] = {}
         self._parse(point_payloads)
 
-    def _parse(self, point_payloads: list[dict]) -> None:
+    def _parse(self, point_payloads: list[dict | None]) -> None:
         time_count = len(self.times)
         for variable in self.variables:
             level_arrays: list[np.ndarray] = []
@@ -242,6 +290,9 @@ class WeatherResult:
                 key = f"{variable}_{level}hPa"
                 point_series: list[list[float]] = []
                 for point in point_payloads:
+                    if point is None:  # point outside the model domain
+                        point_series.append([np.nan] * time_count)
+                        continue
                     raw_series = point.get("hourly", {}).get(key)
                     if raw_series is None:
                         series = [np.nan] * time_count

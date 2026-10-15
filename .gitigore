@@ -1,9 +1,0 @@
-# Python 生成的文件
-__pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
-
-# 虚拟环境
-.venv/

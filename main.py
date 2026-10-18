@@ -14,6 +14,7 @@ from weather_data import DataSource, WeatherData
 from cities import get_city, CITIES
 from satellite import get_source, SOURCES
 import fy4b
+import radar
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpd-file", default="",
                         help="optional local FY-4B CPD .nc file (cloud optical thickness); "
                              "with --satellite-source fy4b and --satellite-file this adds the cloud-products transect figure")
+    parser.add_argument("--radar", action=argparse.BooleanOptionalAction, default=False,
+                        help="add an NMC radar-reflectivity strip along the transect")
+    parser.add_argument("--radar-file", default="",
+                        help="optional local NMC radar mosaic PNG (skip region selection/download; region taken from file name)")
     parser.add_argument("--save", action=argparse.BooleanOptionalAction, default=False,
                         help="save the figure to a PNG file")
     parser.add_argument("--silent", action=argparse.BooleanOptionalAction, default=False,
@@ -77,6 +82,10 @@ SATELLITE_SOURCE = args.satellite_source
 SATELLITE_FILE = args.satellite_file
 CPD_FILE = args.cpd_file
 
+# 雷达反射率开关
+INCLUDE_RADAR = args.radar
+RADAR_FILE = args.radar_file
+
 # 是否保存图片
 SILENT_MODE = args.silent
 SAVE_FIGURE = args.save
@@ -107,8 +116,10 @@ SUN_ELEVATION = sun.position.geometric_elevation  # 负值表示太阳在地平�
 # 空间跨度配置：从 -100km 到 900km
 X_MIN, X_MAX = -100, 900
 STEP_KM = 20
+RADAR_STEP_KM = 1  # radar pixels are ~1.4-2.4 km, so sample the radar much finer than the model grid
 
 distances = np.arange(X_MIN, X_MAX + STEP_KM, STEP_KM)
+radar_distances = np.arange(X_MIN, X_MAX + RADAR_STEP_KM, RADAR_STEP_KM)
 
 # 垂直气压层与对应的大致海拔高度 (米)
 PRESSURE_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200, 150, 100]
@@ -138,6 +149,9 @@ for d in distances:
     pt_lat, pt_lon = get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH)
     lats.append(pt_lat)
     lons.append(pt_lon)
+
+radar_lats, radar_lons = zip(*(
+    get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH) for d in radar_distances))
 
 # ==================== 3. 请求气象数据 (相对湿度与云量) ====================
 print(
@@ -190,8 +204,26 @@ if INCLUDE_SATELLITE:
     cloud_top_temp_c = cloud_top.temperature_c
     cloud_top_alt_km = cloud_top.altitude_km
 
+# 3.4 NMC 雷达组合反射率：沿剖面采样 (可选，雷达回波强 -> 云多)
+radar_dbz = None
+if INCLUDE_RADAR:
+    radar_result = radar.read_reflectivity(sun.time, radar_lats, radar_lons, local_file=RADAR_FILE,
+                                           half_window=0)
+    radar_dbz = radar_result.dbz
+    if radar_dbz is None:
+        print("Radar: no picture found, strip skipped.")
+    else:
+        radar_times = ", ".join(f"{k} {t:%Y-%m-%d %H:%M}" for k, t in radar_result.obs_times_utc.items())
+        print(f"Radar pictures (UTC): {radar_times}")
+
 # ==================== 4. 绘制剖面图与模拟光路 ====================
-fig, ax = plt.subplots(figsize=(14, 6), dpi=120)
+if radar_dbz is not None:
+    fig, (ax, ax_radar) = plt.subplots(
+        2, 1, figsize=(14, 6.8), dpi=120, sharex=True,
+        gridspec_kw={"height_ratios": [12, 1], "hspace": 0.12},
+    )
+else:
+    fig, ax = plt.subplots(figsize=(14, 6), dpi=120)
 
 # 4.1 绘制相对湿度背景色 (与 ExampleProfile.png 色标一致)
 X, Y = np.meshgrid(distances, ALTITUDES_KM)
@@ -226,6 +258,34 @@ if cloud_top_alt_km is not None:
     ax.plot(distances, cloud_top_alt_km, color='darkgreen',
             marker='s', markersize=3, linewidth=1.5,
             label='FY-4B cloud-top height (km)')
+
+# 4.1f 雷达反射率条带 (沿剖面，色标与 NMC 图例一致；白色=无回波，灰色=雷达范围外)
+if radar_dbz is not None:
+    radar_cmap = ListedColormap(radar.LEGEND_RGB / 255.0)
+    radar_cmap.set_under("white")
+    radar_cmap.set_bad("lightgray")
+    radar_edges = np.r_[5.0 + 5.0 * np.arange(len(radar.LEGEND_RGB)), 1e9]
+    radar_norm = BoundaryNorm(radar_edges, radar_cmap.N)
+    half = RADAR_STEP_KM / 2
+    ax_radar.imshow(
+        np.where(radar_dbz > 0, radar_dbz, np.where(np.isnan(radar_dbz), np.nan, -1.0))[None, :], cmap=radar_cmap, norm=radar_norm,
+        aspect="auto", extent=(radar_distances[0] - half, radar_distances[-1] + half, 0, 1),
+        interpolation="nearest",
+    )
+    # Legend of the reflectivity classes; placed under the RH colorbar after layout.
+    n_leg = len(radar.LEGEND_RGB)
+    radar_handles = [
+        Patch(facecolor=radar.LEGEND_RGB[i] / 255.0, edgecolor="0.4", linewidth=0.3,
+              label=f"{5 + 5 * i}+" if i == n_leg - 1 else f"{5 + 5 * i}-{10 + 5 * i}")
+        for i in range(n_leg)
+    ]
+    ax_radar.set_yticks([])
+    ax_radar.set_ylabel("Radar", rotation=0, ha="right", va="center")
+    ax_radar.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
+    ax_radar.set_title(
+        f"NMC composite reflectivity {radar_times} UTC "
+        "(NMC colours, 5-70+ dBZ; white = no echo, gray = outside mosaic)",
+        fontsize=9, loc="left")
 
 # 4.2 计算并绘制两条边界光路 (光线追踪)
 # 展平坐标系：x 为沿地表朝向太阳的距离 (km)，y 为海拔高度 (km)。
@@ -262,7 +322,8 @@ ax.fill_between(distances, -1, 0, color='gray', alpha=0.3, label='Ground')
 # ==================== 5. 图表美化 ====================
 title = f"{DATE.replace('-', '')}_{city.name.replace(' ', '')}_{EVENT}_{DATA_SOURCE.name}_{DATA_UPDATE_STR}"
 ax.set_title(title, fontsize=14, fontweight='bold')
-ax.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
+if radar_dbz is None:
+    ax.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
 ax.set_ylabel("Altitude (km)", fontsize=12)
 ax.set_xlim(X_MIN, X_MAX)
 ax.set_ylim(0, 16) # 对流层高度
@@ -277,7 +338,21 @@ if cloud_top_line is not None:
     labels.append('Cloud-top temp proxy (°C)')
 ax.legend(handles=handles, labels=labels, loc='lower right')
 
-plt.tight_layout()
+if radar_dbz is None:
+    plt.tight_layout()
+else:
+    # The RH colorbar narrows the main axes; give the radar strip the same x extent
+    # so the distance axes line up.
+    fig.canvas.draw()
+    main_pos, radar_pos = ax.get_position(), ax_radar.get_position()
+    ax_radar.set_position([main_pos.x0, radar_pos.y0, main_pos.width, radar_pos.height])
+    # Radar legend: one horizontal row centred under the x-axis title.
+    xlabel_bb = ax_radar.xaxis.label.get_window_extent(fig.canvas.get_renderer()).transformed(
+        fig.transFigure.inverted())
+    fig.legend(handles=radar_handles, title="Radar reflectivity (dBZ)", loc="upper center",
+               ncol=len(radar_handles), bbox_to_anchor=(main_pos.x0 + main_pos.width / 2, xlabel_bb.y0 - 0.01),
+               fontsize=9, title_fontsize=9, handlelength=1.0, handleheight=0.7,
+               columnspacing=0.8, handletextpad=0.4, borderpad=0.4, framealpha=0.85)
 if SAVE_FIGURE:
     out_path = f"{title}.png"
     fig.savefig(out_path, dpi=120, bbox_inches="tight")

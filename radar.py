@@ -8,7 +8,9 @@ numeric data, so this module recovers dBZ from the pictures:
      pixels that radar painted;
   2. each remaining pixel's colour is matched to the legend colour bar
      (5 .. 70 dBZ, one 5 dBZ bin per colour);
-  3. regions that are not part of the mosaic (legend, inset maps) are masked
+  3. with a base image, small and weak echo regions (speckle) are removed
+     from the subtracted result (`remove_speckle`);
+     regions that are not part of the mosaic (legend, inset maps) are masked
      out as "not covered" (NaN);
   4. pixel (row, col) <-> (lat, lon) comes from `radar_map_cn.RadarMap`, which
      also decides which regional pictures a transect needs.
@@ -56,6 +58,11 @@ LEGEND_DBZ = 5.0 + 5.0 * np.arange(len(LEGEND_RGB)) + 2.5  # bin centres
 BASE_DIFF_TOL = 24.0         # min max-channel difference from the base to count as "painted"
 COLOR_TOL_WITH_BASE = 45.0   # max RGB distance to a legend colour (base available)
 COLOR_TOL_NO_BASE = 20.0     # stricter without a base: blue sea / rivers look alike
+
+# Speckle filter: an echo region (8-connected pixels with dbz > 0, any class) is
+# removed when it is both small and weak.
+SPECKLE_MAX_AREA_PX = 3      # region with at most this many pixels is "small"
+SPECKLE_WEAK_DBZ = 15.0      # region whose strongest pixel is below this is "weak"
 
 
 @dataclass
@@ -161,6 +168,38 @@ def _load_rgb(path: str, radar_map: RadarMap) -> np.ndarray:
     return arr[:radar_map.map_rows]
 
 
+def remove_speckle(dbz: np.ndarray, max_area_px: int = SPECKLE_MAX_AREA_PX,
+                   weak_dbz: float = SPECKLE_WEAK_DBZ) -> np.ndarray:
+    """Zero out echo regions that are small (<= `max_area_px` pixels) *and* weak
+    (peak < `weak_dbz`).  Regions are 8-connected groups of pixels with dbz > 0,
+    regardless of class; NaN (masked) pixels are left untouched.  A small but
+    strong region, or a large weak one, is kept.
+    """
+    echo = np.nan_to_num(dbz, nan=0.0) > 0
+    h, w = echo.shape
+    seen = np.zeros_like(echo)
+    out = dbz.copy()
+    for y0, x0 in zip(*np.nonzero(echo)):
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        stack, region = [(y0, x0)], []
+        while stack:
+            y, x = stack.pop()
+            region.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    yy, xx = y + dy, x + dx
+                    if 0 <= yy < h and 0 <= xx < w and echo[yy, xx] and not seen[yy, xx]:
+                        seen[yy, xx] = True
+                        stack.append((yy, xx))
+        if len(region) <= max_area_px:
+            ys, xs = zip(*region)
+            if dbz[ys, xs].max() < weak_dbz:
+                out[ys, xs] = 0.0
+    return out
+
+
 def decode(image_path: str, radar_map: RadarMap, base_path: str | None = None) -> np.ndarray:
     """Convert a radar picture to a (map_rows, width) dBZ array.
 
@@ -182,7 +221,9 @@ def decode(image_path: str, radar_map: RadarMap, base_path: str | None = None) -
         valid = best <= COLOR_TOL_NO_BASE
     dbz = np.where(valid, LEGEND_DBZ[nearest], 0.0)
     dbz[radar_map.mask_array(dbz.shape)] = np.nan
-    return dbz
+    # Speckle filtering only on the base-subtracted result (colour-only decoding
+    # is already the less reliable path and is left unfiltered).
+    return remove_speckle(dbz) if base is not None else dbz
 
 
 def sample_at(dbz: np.ndarray, radar_map: RadarMap, lats, lons, half_window: int = 3) -> np.ndarray:

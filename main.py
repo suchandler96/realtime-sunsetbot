@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event", default="sunset", choices=["sunrise", "sunset"],
                         help="which solar event to plot")
     parser.add_argument("--data-source", default=DataSource.GFS.name,
-                        choices=[s.name for s in DataSource], help="weather model: GFS, ECMWF, JMA_MSM, CMA_GFS")
+                        choices=[s.name for s in DataSource], help="weather model: GFS, ECMWF, JMA_MSM, CMA_GFS, HRRR")
     parser.add_argument("--cloud-base", type=float, default=-1,
                         help="manual cloud base height in km")
     parser.add_argument("--satellite", action=argparse.BooleanOptionalAction, default=False,
@@ -93,9 +93,9 @@ SAVE_FIGURE = args.save
 # 模型数据更新时间估算 (UTC 起报时刻)。
 # Open-Meteo 标准 forecast 接口不直接返回起报时刻，这里按当前时间与模型循环周期估算。
 MODEL_CYCLE_HOURS = {DataSource.GFS: 6, DataSource.ECMWF: 12, DataSource.JMA_MSM: 3,
-                     DataSource.CMA_GFS: 6}
+                     DataSource.CMA_GFS: 6, DataSource.HRRR: 1}
 MODEL_RUN_DELAY_HOURS = {DataSource.GFS: 5, DataSource.ECMWF: 9, DataSource.JMA_MSM: 2,
-                         DataSource.CMA_GFS: 6}
+                         DataSource.CMA_GFS: 6, DataSource.HRRR: 2}
 
 
 def latest_model_run(source):

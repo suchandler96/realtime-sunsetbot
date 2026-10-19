@@ -37,15 +37,18 @@ class DataSource(str, Enum):
     ECMWF = "ecmwf_ifs025"
     JMA_MSM = "jma_msm"
     CMA_GFS = "cma_grapes_global"
+    HRRR = "ncep_hrrr_conus"
 
 
 # Geographic domain of limited-area models as (lat_min, lat_max, lon_min, lon_max)
 # in degrees.  Global models are absent from this map.  Coordinates outside a
 # model's domain are skipped rather than queried, since Open-Meteo rejects an
 # entire multi-point request if any single point is out of range.
-# jma_msm covers the JMA Mesoscale Model area around Japan.
+# jma_msm covers the JMA Mesoscale Model area around Japan; ncep_hrrr_conus
+# covers the contiguous United States (approximate bounds of the HRRR grid).
 MODEL_DOMAIN: dict[DataSource, tuple[float, float, float, float]] = {
     DataSource.JMA_MSM: (22.4, 47.6, 120.0, 150.0),
+    DataSource.HRRR: (21.1, 52.6, -134.1, -60.9),
 }
 
 

@@ -123,6 +123,7 @@ radar_distances = np.arange(X_MIN, X_MAX + RADAR_STEP_KM, RADAR_STEP_KM)
 
 # 垂直气压层与对应的大致海拔高度 (米)
 PRESSURE_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200, 150, 100]
+# Approximate heights; only a fallback when the model gives no geopotential height.
 ALTITUDES_KM = [0.1, 0.2, 0.4, 0.6, 0.8, 1.5, 2.0, 3.0, 4.2, 5.6, 7.2, 9.2, 10.4, 11.8, 13.6, 16.2]
 
 # 相对湿度色标 (与 ExampleProfile.png 一致)
@@ -165,6 +166,7 @@ weather = (
     .relative_humidity()
     .cloud_cover()
     .temperature()
+    .geopotential_height()
     .timezone(TIMEZONE)
     .on(DATE)
     .fetch()
@@ -172,8 +174,18 @@ weather = (
 
 print(f"Computed {EVENT} time: {sun.time:%Y-%m-%d %H:%M:%S %Z}")
 
+# Some models lack some pressure levels (e.g. ECMWF: 975/950/900/800 hPa); fill them by interpolation.
+filled_levels = weather.fill_missing_levels()
+if filled_levels:
+    print(f"Interpolated pressure levels missing in {DATA_SOURCE.value}: "
+          + ", ".join(f"{p} hPa" for p in filled_levels))
+
 # 选择距离日出/日落时刻最近的小时
 time_idx = weather.nearest_index(sun.time)
+
+# 每个剖面点、每个气压层的真实位势高度 (km)；缺失时退回到 ALTITUDES_KM 近似表
+height_km = weather.values("geopotential_height")[:, :, time_idx] / 1000.0
+height_km = np.where(np.isnan(height_km), np.asarray(ALTITUDES_KM)[:, None], height_km)
 
 # 3.1 本地(x=0)云底高度
 if AUTO_CLOUD_BASE:
@@ -184,7 +196,7 @@ if AUTO_CLOUD_BASE:
 
     cloud_layer_mask = (rh_at_observer >= 80) | (cloud_at_observer >= 50)
     if np.any(cloud_layer_mask):
-        local_cbh_km = ALTITUDES_KM[int(np.argmax(cloud_layer_mask))]
+        local_cbh_km = float(height_km[int(np.argmax(cloud_layer_mask)), obs_idx])
     else:
         local_cbh_km = 6.0  # 晴空无云时，默认设定一个高空火烧云幕布高度
 else:
@@ -226,7 +238,8 @@ else:
     fig, ax = plt.subplots(figsize=(14, 6), dpi=120)
 
 # 4.1 绘制相对湿度背景色 (与 ExampleProfile.png 色标一致)
-X, Y = np.meshgrid(distances, ALTITUDES_KM)
+X = np.broadcast_to(distances, height_km.shape)
+Y = height_km  # (levels, points): true height of each pressure level at each point
 rh_cmap = ListedColormap(RH_COLORS)
 rh_norm = BoundaryNorm(RH_BOUNDS, rh_cmap.N)
 contour = ax.contourf(X, Y, rh_matrix, levels=RH_BOUNDS, cmap=rh_cmap, norm=rh_norm)

@@ -220,6 +220,10 @@ class WeatherRequest:
     def temperature(self) -> "WeatherRequest":
         return self.variables("temperature")
 
+    def geopotential_height(self) -> "WeatherRequest":
+        """Height (m) of each pressure level; lets callers use true heights."""
+        return self.variables("geopotential_height")
+
     # ----- temporal window --------------------------------------------
     def forecast_days(self, days: int) -> "WeatherRequest":
         self._forecast_days = days
@@ -321,6 +325,40 @@ class WeatherResult:
         except ValueError as exc:
             raise KeyError(f"pressure level {pressure} hPa was not requested") from exc
         return self.values(variable)[level_index]
+
+    def fill_missing_levels(self) -> list[int]:
+        """Interpolate pressure levels a model does not provide.
+
+        Some models (e.g. ECMWF IFS 0.25° open data lacks 975/950/900/800 hPa)
+        return no values on some requested levels.  For every point and time,
+        a level that is NaN while at least two other levels are valid is filled
+        by linear interpolation in ln(pressure) between its valid neighbours.
+        Levels above/below the valid range are not extrapolated.  Returns the
+        pressure levels (hPa) that were filled anywhere.
+        """
+        log_p = np.log(np.asarray(self.pressure_levels, dtype=float))
+        order = np.argsort(log_p)
+        filled_levels: set[int] = set()
+        for array in self._arrays.values():
+            n_levels, n_points, n_times = array.shape
+            for ip in range(n_points):
+                for it in range(n_times):
+                    column = array[:, ip, it]
+                    bad = np.isnan(column)
+                    if not bad.any() or (~bad).sum() < 2:
+                        continue
+                    xs = log_p[order]
+                    ys = column[order]
+                    ok = ~np.isnan(ys)
+                    fill = np.interp(xs, xs[ok], ys[ok], left=np.nan, right=np.nan)
+                    new = np.where(bad[order], fill, ys)
+                    result = np.empty(n_levels)
+                    result[order] = new
+                    changed = bad & ~np.isnan(result)
+                    if changed.any():
+                        array[:, ip, it] = result
+                        filled_levels.update(self.pressure_levels[i] for i in np.nonzero(changed)[0])
+        return sorted(filled_levels, reverse=True)
 
     def nearest_index(self, when: datetime) -> int:
         """Return the time index closest to `when` (naive local wall time)."""

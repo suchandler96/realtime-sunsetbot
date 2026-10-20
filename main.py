@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import sys
 from datetime import datetime, timedelta, timezone, date
 
 import numpy as np
@@ -11,7 +12,7 @@ from matplotlib.lines import Line2D
 
 from solar import sun_event
 from weather_data import DataSource, WeatherData
-from cities import get_city, CITIES
+from cities import get_city, custom_city, CITIES
 from satellite import get_source, SOURCES
 import fy4b
 import radar
@@ -22,8 +23,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot an atmosphere cross-section near sunrise/sunset."
     )
-    parser.add_argument("--city", default="Shanghai", choices=[c.name for c in CITIES],
-                        help="city name from cities.py")
+    parser.add_argument("--city", default=None, choices=[c.name for c in CITIES],
+                        help="city name from cities.py (default: Shanghai, unless --lat/--lon are given)")
+    parser.add_argument("--lat", type=float, default=None,
+                        help="observer latitude in degrees north (-90..90); use with --lon instead of --city")
+    parser.add_argument("--lon", type=float, default=None,
+                        help="observer longitude in degrees east (-180..180, or 0..360)")
+    parser.add_argument("--place-name", default=None,
+                        help="label for the figure title / file name when using --lat/--lon "
+                             "(default: the coordinates)")
+    parser.add_argument("--timezone", default=None,
+                        help="IANA time zone for --lat/--lon, e.g. Asia/Shanghai "
+                             "(default: looked up from the coordinates)")
     parser.add_argument("--date", default=date.today().strftime('%Y-%m-%d'), help="local date YYYY-MM-DD")
     parser.add_argument("--event", default="sunset", choices=["sunrise", "sunset"],
                         help="which solar event to plot")
@@ -54,7 +65,18 @@ def parse_args() -> argparse.Namespace:
 
 # ==================== 1. 核心参数配置 ====================
 args = parse_args()
-city = get_city(args.city)
+if (args.lat is None) != (args.lon is None):
+    sys.exit("--lat and --lon must be given together")
+if args.lat is not None:
+    if args.city:
+        sys.exit("use either --city or --lat/--lon, not both")
+    try:
+        city = custom_city(args.lat, args.lon, args.place_name, args.timezone)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    print(f"Observer: {city.name} ({city.latitude:.4f}, {city.longitude:.4f}), time zone {city.timezone}")
+else:
+    city = get_city(args.city or "Shanghai")
 R_EARTH_EQUATOR = 6378.1370
 R_EARTH_POLAR = 6356.7523
 

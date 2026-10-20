@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import requests
+
 
 @dataclass(frozen=True)
 class City:
@@ -47,3 +49,40 @@ def get_city(name: str) -> City:
         if city.name.lower() == key:
             return city
     raise KeyError(f"unknown city '{name}' (available: {', '.join(c.name for c in CITIES)})")
+
+
+def lookup_timezone(latitude: float, longitude: float) -> str:
+    """IANA time zone of a point, from Open-Meteo; falls back to a fixed offset from the longitude.
+
+    The fallback (``Etc/GMT-8`` for 120 E, ...) has no daylight saving and ignores political
+    borders, so pass an explicit zone when it matters.
+    """
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={"latitude": latitude, "longitude": longitude, "timezone": "auto",
+                    "daily": "sunrise", "forecast_days": 1},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()["timezone"]
+    except (requests.RequestException, KeyError, ValueError):
+        hours = round(longitude / 15.0)
+        return f"Etc/GMT{-hours:+d}" if hours else "UTC"
+
+
+def custom_city(latitude: float, longitude: float, name: str | None = None,
+                timezone: str | None = None) -> City:
+    """An observer at arbitrary coordinates, shaped like the entries of ``CITIES``.
+
+    ``name`` is used in the figure's title and file name (default: the coordinates);
+    ``timezone`` is looked up from the coordinates when omitted.
+    """
+    if not -90.0 <= latitude <= 90.0:
+        raise ValueError(f"latitude {latitude} is outside -90..90")
+    if not -180.0 <= longitude <= 180.0:
+        longitude = ((longitude + 180.0) % 360.0) - 180.0  # accept 0..360 too
+    if name is None:
+        name = (f"{abs(latitude):.2f}{'N' if latitude >= 0 else 'S'}_"
+                f"{abs(longitude):.2f}{'E' if longitude >= 0 else 'W'}")
+    return City(name, latitude, longitude, timezone or lookup_timezone(latitude, longitude))

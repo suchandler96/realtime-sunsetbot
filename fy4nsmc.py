@@ -7,8 +7,8 @@ simpler one on https://data.nsmc.org.cn/DataPortal: the web page's own steps are
     -> click the download icon of the newest file in the pop-up list
 
 and this script does the same through the portal's JSON API.  Searching needs no
-login; downloading does, with a verification code on login that **you type** (the
-captcha image is saved to a file; nothing is solved automatically).  The login
+login; downloading does, with a verification code on login (the
+captcha image is saved to a file).  The login
 session is cached so later runs usually need no code at all.
 
     python fy4nsmc.py                 # newest CTH and CTT file
@@ -33,6 +33,7 @@ import time
 import uuid
 from html import unescape as html_unescape
 from datetime import datetime, timedelta, timezone
+from random import random
 
 import requests
 
@@ -197,7 +198,45 @@ class Portal:
             with open(self.captcha_path, "wb") as f:
                 f.write(img.content)
             shown = time.time()
-            code = self._ask_code()
+            # code = self._ask_code()
+
+            import cv2
+            import pytesseract
+            from PIL import Image
+
+            def solve_captcha(image_path):
+                # 2. 读取图片并转为灰度图
+                img = cv2.imread(image_path)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+                # 3. 预处理：二值化（使用 OTSU 自动阈值，比固定阈值更稳）
+                # 如果背景干净，也可以直接用 _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+                mask = (binary[:, 1:-1] == 0) & (binary[:, :-2] == 255) & (binary[:, 2:] == 255)
+                binary[:, 1:-1][mask] = 255
+                mask_h = (binary[1:-1, :] == 0) & (binary[:-2, :] == 255) & (binary[2:, :] == 255)
+                binary[1:-1, :][mask_h] = 255
+                # cv2.imwrite(self.captcha_path[:-4] + "_denoised" + self.captcha_path[-4:], binary)
+
+                # 可选：放大图像（Tesseract 对小字符识别差，放大 2 倍通常有帮助）
+                # binary = cv2.resize(binary, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+                # 4. 转为 PIL Image 格式供 pytesseract 使用
+                pil_img = Image.fromarray(binary)
+
+                # 5. 关键配置：限定字符集和分割模式
+                # --psm 8: 将图像视为单个单词，适合验证码这种孤立字符
+                # tessedit_char_whitelist: 限定只识别你期望的字符，排除标点、空格等干扰
+                custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+                # 6. 执行识别
+                text = pytesseract.image_to_string(pil_img, config=custom_config)
+                return text.strip()
+            code = solve_captcha(self.captcha_path)
+            print("OCR result:", code)
+
+            time.sleep(2 + 2 * random())
             print(f"answered {time.time() - shown:.0f}s after the page was loaded")
             res = self.s.post(auth + "/commit", timeout=60, json={
                 "userName": username, "thePassword": rsa_encrypt_b64(form["key"], password),

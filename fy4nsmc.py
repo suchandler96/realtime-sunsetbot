@@ -7,8 +7,8 @@ simpler one on https://data.nsmc.org.cn/DataPortal: the web page's own steps are
     -> click the download icon of the newest file in the pop-up list
 
 and this script does the same through the portal's JSON API.  Searching needs no
-login; downloading does, with a verification code on login that **you type** (the
-captcha image is saved to a file; nothing is solved automatically).  The login
+login; downloading does, with a verification code on login (the
+captcha image is saved to a file).  The login
 session is cached so later runs usually need no code at all.
 
     python fy4nsmc.py                 # newest CTH and CTT file
@@ -33,6 +33,7 @@ import time
 import uuid
 from html import unescape as html_unescape
 from datetime import datetime, timedelta, timezone
+from random import random
 
 import requests
 
@@ -88,6 +89,112 @@ def rsa_encrypt_b64(b64url_key, text):
 def _input_value(html, element_id):
     m = re.search(r'<input[^>]*id="%s"[^>]*value="([^"]*)"' % re.escape(element_id), html)
     return m.group(1) if m else ""
+
+
+CAPTCHA_LENGTH = 4
+CAPTCHA_MARGIN = 2        # white columns kept between a character and the edge of its crop
+CAPTCHA_MAX_CROSSED = 2   # a cut may cross at most this many black pixels
+CAPTCHA_SIMILAR = 20      # RGB (Euclidean) distance below which two pixels count as the same colour
+CAPTCHA_PRINT_INTERMEDIATE_IMG = False  # save the denoised, binarised and per-character images next to the captcha
+
+
+def _denoise(image):
+    """Replace a pixel by the background colour unless it continues a similar colour both
+    horizontally (left or right neighbour) and vertically (upper or lower neighbour).
+
+    image: (height, width, 3) colour image; two pixels are similar when their distance in RGB
+    space is below CAPTCHA_SIMILAR.  The background colour is the per-channel median.
+    """
+    import numpy as np
+    bg = np.median(image.reshape(-1, 3), axis=0).astype(image.dtype)
+    padded = np.pad(image.astype(float), ((1, 1), (1, 1), (0, 0)))
+    padded[0], padded[-1], padded[:, 0], padded[:, -1] = bg, bg, bg, bg
+    centre = image.astype(float)
+
+    def similar(rows, cols):
+        return np.linalg.norm(padded[rows, cols] - centre, axis=2) < CAPTCHA_SIMILAR
+
+    inner, before, after = slice(1, -1), slice(0, -2), slice(2, None)
+    horizontal = similar(inner, before) | similar(inner, after)
+    vertical = similar(before, inner) | similar(after, inner)
+    cleaned = image.copy()
+    cleaned[~(horizontal & vertical)] = bg
+    return cleaned
+
+
+def _split_columns(binary, parts=CAPTCHA_LENGTH):
+    """Cut the binarised image (black text = 0) into `parts` crops along the columns.
+
+    Each cut is searched around the equal-width position: columns crossing at most
+    CAPTCHA_MAX_CROSSED black pixels win, then the one with the fewest black pixels within
+    CAPTCHA_MARGIN columns of it, then the one nearest to the equal-width position.  A crop whose
+    text lies closer than CAPTCHA_MARGIN pixels to a side is padded with white.
+    """
+    import numpy as np
+    import cv2
+    height, width = binary.shape
+    ink = (binary == 0).sum(axis=0)
+    reach = max(1, width // (2 * parts))
+    cuts = [0]
+    for k in range(1, parts):
+        ideal = round(width * k / parts)
+        window = range(max(cuts[-1] + 1, ideal - reach), min(width - 1, ideal + reach) + 1)
+        cuts.append(min(window, key=lambda c: (ink[c] > CAPTCHA_MAX_CROSSED,
+                                               ink[max(0, c - CAPTCHA_MARGIN):c + CAPTCHA_MARGIN + 1].sum(),
+                                               abs(c - ideal))))
+    cuts.append(width)
+    crops = []
+    for a, b in zip(cuts, cuts[1:]):
+        crop = binary[:, a:b]
+        columns = np.flatnonzero((crop == 0).any(axis=0))
+        left = max(0, CAPTCHA_MARGIN - columns[0]) if len(columns) else CAPTCHA_MARGIN
+        right = max(0, CAPTCHA_MARGIN - (crop.shape[1] - 1 - columns[-1])) if len(columns) else CAPTCHA_MARGIN
+        crops.append(cv2.copyMakeBorder(crop, 0, 0, left, right, cv2.BORDER_CONSTANT, value=255))
+    return crops
+
+
+def solve_captcha(image_path):
+    """OCR the captcha: denoise, binarise (Otsu), split into one image per character, read each.
+
+    A per-character reading longer than CAPTCHA_LENGTH has its identical neighbours (ignoring case)
+    reduced to one character.  If the result still is not CAPTCHA_LENGTH characters long, the
+    binarised image is read again as a whole line.
+    """
+    import cv2
+    import pytesseract
+    from PIL import Image
+
+    denoised = _denoise(cv2.imread(image_path))  # BGR vs RGB does not change distances
+    gray = cv2.cvtColor(denoised, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    crops = _split_columns(binary)
+    if CAPTCHA_PRINT_INTERMEDIATE_IMG:
+        stem = os.path.splitext(image_path)[0]
+        cv2.imwrite(f"{stem}_denoised.png", denoised)
+        cv2.imwrite(f"{stem}_binary.png", binary)
+        for i, crop in enumerate(crops, 1):
+            cv2.imwrite(f"{stem}_char{i}.png", crop)
+    whitelist = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"  # no punctuation / spaces
+
+    def read(image, psm):
+        text = pytesseract.image_to_string(
+            Image.fromarray(image), config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist={whitelist}")
+        return "".join(text.split())
+
+    # --psm 10: a single character
+    code = "".join(read(crop, 10) for crop in crops)
+    if len(code) > CAPTCHA_LENGTH:  # a character read twice (e.g. by two crops): drop the duplicate (keep the first)
+        deduplicated = []
+        for char in code:
+            if not deduplicated or deduplicated[-1].lower() != char.lower():
+                deduplicated.append(char)
+        code = "".join(deduplicated)
+    if len(code) == CAPTCHA_LENGTH:
+        return code
+    # --psm 7: a single text line; a white border helps Tesseract with text touching the image edge
+    whole = read(cv2.copyMakeBorder(binary, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255), 7)
+    print(f"Captcha: per-character reading {code!r} is not plausible; whole-image reading {whole!r}")
+    return whole
 
 
 class PortalError(RuntimeError):
@@ -184,7 +291,7 @@ class Portal:
             raise PortalError("could not find the login key / public key on the sign-in page")
         return form, page.url.split("/v1/user/login")[0] + "/v1/user"  # https://.../authcenter/v1/user
 
-    def login(self, username, password, attempts=4):
+    def login(self, username, password, attempts=8):
         """Sign in through the portal's auth centre (the same page the browser is sent to)."""
         for attempt in range(1, attempts + 1):
             form, auth = self._signin_page()  # fresh page (and keys) for every attempt
@@ -197,7 +304,12 @@ class Portal:
             with open(self.captcha_path, "wb") as f:
                 f.write(img.content)
             shown = time.time()
-            code = self._ask_code()
+            # code = self._ask_code()
+
+            code = solve_captcha(self.captcha_path)
+            print("OCR result:", code)
+
+            time.sleep(2 + 2 * random())
             print(f"answered {time.time() - shown:.0f}s after the page was loaded")
             res = self.s.post(auth + "/commit", timeout=60, json={
                 "userName": username, "thePassword": rsa_encrypt_b64(form["key"], password),

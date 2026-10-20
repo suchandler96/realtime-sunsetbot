@@ -77,6 +77,9 @@ class Fy4bSource(SatelliteSource):
 
     name = "fy4b"
 
+    def __init__(self, cth_method: str = "nearest"):
+        self.cth_method = cth_method
+
     def read_cloud_top(self, event_utc, lats, lons, now_utc=None, local_file=None):
         path = local_file if local_file and os.path.exists(local_file) else None
         if path is None:
@@ -85,7 +88,7 @@ class Fy4bSource(SatelliteSource):
         if not path:
             return SatelliteCloudTop()
 
-        altitude_km = fy4b.cloud_top_km(path, lats, lons)
+        altitude_km = fy4b.cloud_top_km(path, lats, lons, self.cth_method)
         return SatelliteCloudTop(altitude_km=altitude_km)
 
 
@@ -95,11 +98,11 @@ SOURCES = {
 }
 
 
-def get_source(name: str) -> SatelliteSource:
-    """Return a satellite provider instance by name."""
+def get_source(name: str, cth_method: str = "nearest") -> SatelliteSource:
+    """Return a satellite provider instance by name (``cth_method`` only applies to fy4b)."""
     try:
         source_cls = SOURCES[name]
     except KeyError as exc:
         available = ", ".join(sorted(SOURCES))
         raise KeyError(f"unknown satellite source '{name}' (available: {available})") from exc
-    return source_cls()
+    return source_cls(cth_method) if name == Fy4bSource.name else source_cls()

@@ -15,6 +15,7 @@ from weather_data import DataSource, WeatherData
 from cities import get_city, custom_city, CITIES
 from satellite import get_source, SOURCES
 import fy4b
+import fy4nsmc
 import radar
 
 
@@ -44,14 +45,23 @@ def parse_args() -> argparse.Namespace:
                         help="manual cloud base height in km")
     parser.add_argument("--satellite", action=argparse.BooleanOptionalAction, default=False,
                         help="include a satellite cloud-top layer in the figure")
-    parser.add_argument("--satellite-source", default="himawari",
+    parser.add_argument("--satellite-source", default="fy4b",
                         choices=list(SOURCES.keys()),
                         help="satellite source: himawari -> cloud-top temperature, fy4b -> cloud-top height")
     parser.add_argument("--satellite-file", default="",
-                        help="optional local satellite .nc file (skip download/auto-detect if provided)")
+                        help="optional local satellite .nc file (skip download/auto-detect if provided); "
+                             "with --satellite-source fy4b and no file, the newest FY-4B CTH file is "
+                             "downloaded from the NSMC portal (see fy4nsmc.py)")
     parser.add_argument("--cpd-file", default="",
                         help="optional local FY-4B CPD .nc file (cloud optical thickness); "
                              "with --satellite-source fy4b and --satellite-file this adds the cloud-products transect figure")
+    parser.add_argument("--cth-method", default="weighted", choices=fy4b.CTH_METHODS,
+                        help="how a transect point's FY-4B cloud-top height is taken from the 3x3 pixels around "
+                             "its nearest pixel (valid pixels only): nearest = that pixel; max / median / mean; "
+                             "weighted = mean weighted by the retrieval-quality flag")
+    parser.add_argument("--auto-cpd", action=argparse.BooleanOptionalAction, default=False,
+                        help="with the automatic FY-4B download, also fetch the newest CPD file "
+                             "(cloud optical thickness, daytime only) for the cloud-products transect figure")
     parser.add_argument("--radar", action=argparse.BooleanOptionalAction, default=False,
                         help="add an NMC radar-reflectivity strip along the transect")
     parser.add_argument("--radar-file", default="",
@@ -103,6 +113,8 @@ INCLUDE_SATELLITE = args.satellite
 SATELLITE_SOURCE = args.satellite_source
 SATELLITE_FILE = args.satellite_file
 CPD_FILE = args.cpd_file
+AUTO_CPD = args.auto_cpd
+CTH_METHOD = args.cth_method
 
 # 雷达反射率开关
 INCLUDE_RADAR = args.radar
@@ -233,7 +245,17 @@ temp_matrix = weather.values("temperature")[:, :, time_idx]
 cloud_top_temp_c = None
 cloud_top_alt_km = None
 if INCLUDE_SATELLITE:
-    satellite_source = get_source(SATELLITE_SOURCE)
+    if SATELLITE_SOURCE == "fy4b" and not SATELLITE_FILE:
+        # No file given: fetch the newest FY-4B file(s) from the NSMC portal (login session is cached).
+        wanted = ["CTH"] + (["CPD"] if AUTO_CPD and not CPD_FILE else [])
+        try:
+            downloaded, _ = fy4nsmc.fetch_newest(wanted)
+        except Exception as exc:  # network / login problems must not kill the weather figure
+            print(f"FY-4B download failed ({exc}); continuing without it")
+            downloaded = {}
+        SATELLITE_FILE = (downloaded.get("CTH") or [""])[0]
+        CPD_FILE = CPD_FILE or (downloaded.get("CPD") or [""])[0]
+    satellite_source = get_source(SATELLITE_SOURCE, CTH_METHOD)
     cloud_top = satellite_source.read_cloud_top(sun.time, lats, lons, local_file=SATELLITE_FILE)
     cloud_top_temp_c = cloud_top.temperature_c
     cloud_top_alt_km = cloud_top.altitude_km

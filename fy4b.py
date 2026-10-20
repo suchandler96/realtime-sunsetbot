@@ -36,6 +36,13 @@ _CTH_VALID_RANGE = (1.0, 20000.0)  # metres
 # COT special codes from the CPD product Description attribute.
 _COT_SPECIAL = (-999.0, 65531.0, 65532.0, 65535.0)  # fill, clear, nighttime, space
 
+# How the CTH of a transect point is derived from the 3x3 pixels around its nearest pixel.
+CTH_METHODS = ("nearest", "max", "median", "mean", "weighted")
+# CTH DQF bits 0-1 are the retrieval quality: 0 not converged, 1 poor, 2 better, 3 good (the
+# retrieval uncertainty is >= 0.444, 0.111-0.444, < 0.111 of the first guess for 1, 2, 3).
+# Weight of each level for method "weighted"; level 0 pixels carry no weight.
+QUALITY_WEIGHT = np.array([0.0, 1.0, 2.0, 3.0])
+
 _OBS_RADIUS_KM = 6371.0  # mean Earth radius used for the local transect geometry
 
 
@@ -169,10 +176,75 @@ def sample_at(
     return out
 
 
-def cloud_top_km(path: str, lats, lons) -> np.ndarray:
-    """Convenience: read CTH and return sampled cloud-top height in km."""
+def quality_weights(dqf: np.ndarray) -> np.ndarray:
+    """Per-pixel weight from the retrieval-quality bits (0-1) of the CTH DQF."""
+    level = np.where(np.isfinite(dqf), dqf, 0.0).astype(np.int64) & 3
+    return QUALITY_WEIGHT[level]
+
+
+def sample_window(
+        latitude: np.ndarray,
+        longitude: np.ndarray,
+        values: np.ndarray,
+        lats,
+        lons,
+        method: str = "nearest",
+        weights: np.ndarray | None = None,
+        half: int = 1,
+) -> np.ndarray:
+    """Sample a curvilinear grid at (lat, lon) points from the pixels around each point.
+
+    The pixel nearest to the point is found first.  ``method`` then combines the valid
+    (finite) values in the (2*half+1)^2 window centred on it (3x3 by default):
+
+    * ``nearest``  - the centre pixel only (NaN if it is invalid)
+    * ``max`` / ``median`` / ``mean`` - over the valid pixels of the window
+    * ``weighted`` - mean weighted by ``weights`` (e.g. DQF quality); if every valid pixel has
+      zero weight, the plain mean is used
+
+    A window without any valid pixel gives NaN.
+    """
+    if method not in CTH_METHODS:
+        raise ValueError(f"unknown method '{method}' (choose from {', '.join(CTH_METHODS)})")
+    vals = np.asarray(values, dtype=float)
+    wts = None if weights is None else np.asarray(weights, dtype=float)
+    flat_lat = np.asarray(latitude, dtype=float).ravel()
+    flat_lon = np.asarray(longitude, dtype=float).ravel()
+
+    out = np.full(len(lats), np.nan)
+    for idx, (la, lo) in enumerate(zip(lats, lons)):
+        lo = ((lo + 180.0) % 360.0) - 180.0
+        # Longitude differences shrink with latitude; scale them so "nearest" is by distance.
+        d2 = (flat_lat - la) ** 2 + ((flat_lon - lo) * math.cos(math.radians(la))) ** 2
+        i, j = np.unravel_index(int(np.nanargmin(d2)), vals.shape)
+        if method == "nearest":
+            out[idx] = vals[i, j]
+            continue
+        rows = slice(max(i - half, 0), i + half + 1)
+        cols = slice(max(j - half, 0), j + half + 1)
+        window = vals[rows, cols]
+        valid = np.isfinite(window)
+        if not valid.any():
+            continue
+        picked = window[valid]
+        if method == "max":
+            out[idx] = picked.max()
+        elif method == "median":
+            out[idx] = np.median(picked)
+        elif method == "mean":
+            out[idx] = picked.mean()
+        else:  # weighted
+            w = wts[rows, cols][valid] if wts is not None else np.ones_like(picked)
+            out[idx] = np.average(picked, weights=w) if w.sum() > 0 else picked.mean()
+    return out
+
+
+def cloud_top_km(path: str, lats, lons, method: str = "nearest") -> np.ndarray:
+    """Convenience: read CTH and return the sampled cloud-top height in km (see ``sample_window``)."""
     data = read_cth(path)
-    return sample_at(data.latitude, data.longitude, data.cth_m, lats, lons) / 1000.0
+    cth = sample_window(data.latitude, data.longitude, data.cth_m, lats, lons, method,
+                        weights=quality_weights(data.dqf))
+    return cth / 1000.0
 
 
 def _nearest_pixel_indices(latitude, longitude, lats, lons):

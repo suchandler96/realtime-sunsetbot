@@ -98,34 +98,17 @@ class TooFrequent(PortalError):
 
 
 class Portal:
-    def __init__(self, captcha_path="nsmc_captcha.jpg", captcha_answer_file=None, answer_timeout=300):
+    def __init__(self, captcha_path="nsmc_captcha.jpg", answer_timeout=300):
         self.s = requests.Session()
         self.s.headers["User-Agent"] = USER_AGENT
         self.captcha_path = captcha_path
         self.captcha_base = os.path.splitext(captcha_path)[0]
-        self.captcha_answer_file = captcha_answer_file  # if set, the code is read from this file
         self.answer_timeout = answer_timeout
 
     def _ask_code(self):
-        """The verification code, typed by a human: at the prompt, or written into the answer file."""
-        if not self.captcha_answer_file:
-            return input(f"Verification code (open {os.path.abspath(self.captcha_path)}; "
-                         "the page expires quickly, so answer promptly): ").strip()
-        if os.path.exists(self.captcha_answer_file):
-            os.remove(self.captcha_answer_file)  # never reuse an old answer
-        print(f"Captcha image: {os.path.abspath(self.captcha_path)}\n"
-              f"Write the code into {os.path.abspath(self.captcha_answer_file)} (waiting up to {self.answer_timeout}s)")
-        deadline = time.time() + self.answer_timeout
-        while time.time() < deadline:
-            if os.path.exists(self.captcha_answer_file):
-                time.sleep(0.3)  # let the writer finish
-                with open(self.captcha_answer_file) as f:
-                    code = f.read().strip()
-                if code:
-                    os.remove(self.captcha_answer_file)
-                    return code
-            time.sleep(0.5)
-        raise PortalError("timed out waiting for the captcha answer")
+        """The verification code, typed by a human: at the prompt."""
+        return input(f"Verification code (open {os.path.abspath(self.captcha_path)}; "
+                     "the page expires quickly, so answer promptly): ").strip()
 
     # -- generic -----------------------------------------------------------
     def get_json(self, path, **kw):
@@ -310,7 +293,7 @@ def read_credentials(path):
 
 def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, file_timeout=30,
                  session_file=DEFAULT_SESSION_FILE, use_session_cache=True, search_only=False, portal=None,
-                 captcha_answer_file=None, credentials_file=None):
+                 credentials_file=None):
     """Download the newest ``count`` files of each product; returns ``({product: [paths]}, n_failed)``.
 
     Files already present (same size) are reused without logging in.  Logging in happens only when
@@ -320,7 +303,7 @@ def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, 
     begin = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
     end = now.replace(hour=23, minute=59, second=59, microsecond=0)
 
-    portal = portal or Portal(captcha_answer_file=captcha_answer_file)
+    portal = portal or Portal()
     found, failures = {}, 0
     for datatype in products:
         found[datatype] = []
@@ -383,15 +366,13 @@ def main():
     ap.add_argument("--search-only", action="store_true", help="list the files, do not download")
     ap.add_argument("--session-file", default=DEFAULT_SESSION_FILE, help="cached login cookies")
     ap.add_argument("--no-session-cache", action="store_true", help="do not read or write the session file")
-    ap.add_argument("--captcha-file", help="read the verification code from this file instead of the prompt "
-                                           "(you write the code you see in nsmc_captcha.jpg into it)")
     ap.add_argument("--credentials-file", help="text file: user name on line 1, password on line 2")
     args = ap.parse_args()
 
     _, failures = fetch_newest(
         args.product, args.out, args.count, args.days, args.candidates, args.file_timeout,
         args.session_file, not args.no_session_cache, args.search_only,
-        captcha_answer_file=args.captcha_file, credentials_file=args.credentials_file)
+        credentials_file=args.credentials_file)
     sys.exit(1 if failures else 0)
 
 

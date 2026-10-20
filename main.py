@@ -370,7 +370,7 @@ ax.plot(sun_side_x, latest_light_y(sun_side_x, local_cbh_km),
         color='crimson', linestyle='--', linewidth=2, label='Latest light to cloud base')
 
 # 4.3 标记核心元素
-ax.plot(0, 0, 'ro', markersize=8, label='Observer') # 观测者位置
+ax.plot(0, 0, 'ro', markersize=8)
 ax.plot(0, local_cbh_km, 'gX', markersize=10, label=f'Local Cloud Base ({local_cbh_km:.2f} km)') # 本地云底
 
 # 绘制地平线遮挡提示 (低于0km视为地下)
@@ -388,8 +388,6 @@ ax.grid(True, linestyle=':', alpha=0.5)
 handles, labels = ax.get_legend_handles_labels()
 handles.append(Patch(facecolor='none', edgecolor='dimgray', hatch='///', label='Cloud cover ≥ 50%'))
 labels.append('Cloud cover ≥ 50%')
-handles.append(Line2D([0], [0], color='black', linewidth=0.7, label='Isotherm (5°C)'))
-labels.append('Isotherm (5°C)')
 if cloud_top_line is not None:
     handles.append(cloud_top_line)
     labels.append('Cloud-top temp proxy (°C)')

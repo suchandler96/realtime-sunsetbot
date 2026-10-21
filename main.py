@@ -15,6 +15,7 @@ from weather_data import DataSource, WeatherData
 from cities import get_city, custom_city, CITIES
 from satellite import get_source, SOURCES
 import fy4b
+import aerosol
 import fy4nsmc
 import radar
 
@@ -66,6 +67,11 @@ def parse_args() -> argparse.Namespace:
                         help="add an NMC radar-reflectivity strip along the transect")
     parser.add_argument("--radar-file", default="",
                         help="optional local NMC radar mosaic PNG (skip region selection/download; region taken from file name)")
+    parser.add_argument("--aerosol", action=argparse.BooleanOptionalAction, default=False,
+                        help="draw iso-lines of the CAMS 3D aerosol extinction coefficient "
+                             "(needs an ADS account: ~/.cdsapirc and the dataset licence accepted)")
+    parser.add_argument("--aerosol-wavelength", type=int, default=532, choices=aerosol.WAVELENGTHS_NM,
+                        help="wavelength (nm) of the aerosol extinction coefficient")
     parser.add_argument("--save", action=argparse.BooleanOptionalAction, default=False,
                         help="save the figure to a PNG file")
     parser.add_argument("--silent", action=argparse.BooleanOptionalAction, default=False,
@@ -119,6 +125,11 @@ CTH_METHOD = args.cth_method
 # 雷达反射率开关
 INCLUDE_RADAR = args.radar
 RADAR_FILE = args.radar_file
+
+# 气溶胶消光系数开关
+INCLUDE_AEROSOL = args.aerosol
+AEROSOL_WAVELENGTH = args.aerosol_wavelength
+AEROSOL_LEVELS_KM = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]  # iso-line values of the extinction coefficient (km^-1)
 
 # 是否保存图片
 SILENT_MODE = args.silent
@@ -272,6 +283,22 @@ if INCLUDE_RADAR:
         radar_times = ", ".join(f"{k} {t:%Y-%m-%d %H:%M}" for k, t in radar_result.obs_times_utc.items())
         print(f"Radar pictures (UTC): {radar_times}")
 
+# 3.5 CAMS 三维气溶胶消光系数：沿剖面采样 (可选)
+aerosol_profile = None
+aerosol_height_km = None
+if INCLUDE_AEROSOL:
+    try:
+        aerosol_profile = aerosol.read_extinction(sun.time, lats, lons, AEROSOL_WAVELENGTH)
+    except Exception as exc:  # credentials / network problems must not kill the weather figure
+        print(f"CAMS aerosol failed ({exc}); continuing without it")
+    if aerosol_profile is None:
+        print("Aerosol: no CAMS data available, iso-lines skipped.")
+    else:
+        aerosol_height_km = aerosol.level_heights_km(aerosol_profile.levels_hpa, PRESSURE_LEVELS, height_km)
+        print(f"CAMS aerosol: run {aerosol_profile.run:%Y-%m-%d %Hz}, valid {aerosol_profile.valid:%Y-%m-%d %H:%M} UTC, "
+              f"{AEROSOL_WAVELENGTH} nm extinction {np.nanmin(aerosol_profile.extinction_per_km):.3g}"
+              f"-{np.nanmax(aerosol_profile.extinction_per_km):.3g} km^-1")
+
 # ==================== 4. 绘制剖面图与模拟光路 ====================
 if radar_dbz is not None:
     fig, (ax, ax_radar) = plt.subplots(
@@ -298,6 +325,15 @@ ax.contour(X, Y, cloud_matrix, levels=[50], colors='dimgray', linewidths=0.6, al
 temp_levels = np.arange(-80, 31, 5)
 temp_contour = ax.contour(X, Y, temp_matrix, levels=temp_levels, colors='black', linewidths=0.7)
 ax.clabel(temp_contour, inline=True, fontsize=8, fmt='%d°C')
+
+# 4.1c2 气溶胶消光系数等值线 (CAMS, km^-1)
+aerosol_handle = None
+if aerosol_profile is not None:
+    aerosol_x = np.broadcast_to(distances, aerosol_height_km.shape)
+    aerosol_contour = ax.contour(aerosol_x, aerosol_height_km, aerosol_profile.extinction_per_km,
+                                 levels=AEROSOL_LEVELS_KM, colors='purple', linewidths=1.0, linestyles='--')
+    ax.clabel(aerosol_contour, inline=True, fontsize=8, fmt='%g')
+    aerosol_handle = Line2D([0], [0], color='purple', linestyle='--', linewidth=1.0)
 
 # 4.1d 卫星云顶温度代理 (Himawari tbb_14) 沿剖面
 cloud_top_line = None
@@ -391,6 +427,9 @@ labels.append('Cloud cover ≥ 50%')
 if cloud_top_line is not None:
     handles.append(cloud_top_line)
     labels.append('Cloud-top temp proxy (°C)')
+if aerosol_handle is not None:
+    handles.append(aerosol_handle)
+    labels.append(f'Aerosol extinction {AEROSOL_WAVELENGTH} nm (km⁻¹)')
 ax.legend(handles=handles, labels=labels, loc='lower right')
 
 if radar_dbz is None:

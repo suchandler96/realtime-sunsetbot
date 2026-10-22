@@ -377,7 +377,7 @@ if radar_dbz is not None:
     ax_radar.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
     ax_radar.set_title(
         f"NMC composite reflectivity {radar_times} UTC "
-        "(NMC colours, 5-70+ dBZ; white = no echo, gray = outside mosaic)",
+        "(5-70+ dBZ; white = no echo, gray = outside mosaic)",
         fontsize=9, loc="left")
 
 # 4.2 计算并绘制两条边界光路 (光线追踪)
@@ -387,7 +387,7 @@ sun_side_x = distances[distances >= 0]  # 只绘制朝向太阳的一侧 (x >= 0
 
 
 def earliest_light_y(x, h):
-    """最早能照到云底的光线：与地表 (半径 R) 相切，并经过 (0, h)。"""
+    """最早能照到云底的光线：经过 (0, h)，平行于与地表 (半径 R)于(0,0)相切的光线。"""
     s = x / R_EARTH
     return h + 0.5 * (R_EARTH + h) * s**2 * (1.0 + 5.0 * s**2 / 12.0)
 

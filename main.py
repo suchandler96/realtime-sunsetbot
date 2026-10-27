@@ -10,7 +10,7 @@ from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
 
-from solar import sun_event
+from solar import sun_event, last_light_delay
 from weather_data import DataSource, WeatherData
 from cities import get_city, custom_city, CITIES
 from satellite import get_source, SOURCES
@@ -377,7 +377,7 @@ if radar_dbz is not None:
     ax_radar.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
     ax_radar.set_title(
         f"NMC composite reflectivity {radar_times} UTC "
-        "(5-70+ dBZ; white = no echo, gray = outside mosaic)",
+        "(NMC colours, 5-70+ dBZ; white = no echo, gray = outside mosaic)",
         fontsize=9, loc="left")
 
 # 4.2 计算并绘制两条边界光路 (光线追踪)
@@ -400,10 +400,38 @@ def latest_light_y(x, h):
     return ha + (R_EARTH + ha) * 0.5 * s**2 * (1.0 + 5.0 * s**2 / 12.0)
 
 
-ax.plot(sun_side_x, earliest_light_y(sun_side_x, local_cbh_km),
-        color='darkorange', linestyle='--', linewidth=2, label='Earliest light to cloud base')
-ax.plot(sun_side_x, latest_light_y(sun_side_x, local_cbh_km),
-        color='crimson', linestyle='--', linewidth=2, label='Latest light to cloud base')
+# 两条光线对应的时刻：贴地光线 = 本地日出/日落时刻；掠过气溶胶层顶的光线与之相差 last_light_delay
+# (日落后延迟 / 日出前提前)。日落时贴地光线最早，日出时则最晚。
+ground_ray_time = sun.time
+aerosol_ray_delay = last_light_delay(city.latitude, sun.position.declination, R_EARTH,
+                                     local_cbh_km, min(HA_KM, local_cbh_km))
+aerosol_ray_time = ground_ray_time + (aerosol_ray_delay if EVENT == "sunset" else -aerosol_ray_delay)
+ground_ray_name, aerosol_ray_name = (("Earliest", "Latest") if EVENT == "sunset" else ("Latest", "Earliest"))
+print(f"{ground_ray_name} light to cloud base (ground-grazing ray): {ground_ray_time:%H:%M:%S %Z}; "
+      f"{aerosol_ray_name.lower()} (aerosol-top-grazing ray): {aerosol_ray_time:%H:%M:%S %Z} "
+      f"({aerosol_ray_delay.total_seconds() / 60:.1f} min {'after sunset' if EVENT == 'sunset' else 'before sunrise'})")
+
+ground_ray_y = earliest_light_y(sun_side_x, local_cbh_km)
+aerosol_ray_y = latest_light_y(sun_side_x, local_cbh_km)
+ax.plot(sun_side_x, ground_ray_y, color='darkorange', linestyle='--', linewidth=2,
+        label=f'{ground_ray_name} light to cloud base')
+ax.plot(sun_side_x, aerosol_ray_y, color='crimson', linestyle='--', linewidth=2,
+        label=f'{aerosol_ray_name} light to cloud base')
+
+
+def label_ray_time(x, y, when, color, side, top_km=15.3):
+    """Write the ray's clock time beside it near the top of the figure (side: 'left' or 'right' of the ray)."""
+    inside = np.where(y <= top_km)[0]
+    if len(inside) == 0:
+        return
+    i = inside[-1]  # far end of the ray still inside the axes
+    ax.annotate(f"{when:%H:%M}", (x[i], y[i]), xytext=(6 if side == "right" else -6, 0),
+                textcoords="offset points", ha="left" if side == "right" else "right", va="center",
+                color=color, fontsize=11, fontweight="bold")
+
+
+label_ray_time(sun_side_x, ground_ray_y, ground_ray_time, 'darkorange', "left")
+label_ray_time(sun_side_x, aerosol_ray_y, aerosol_ray_time, 'crimson', "right")
 
 # 4.3 标记核心元素
 ax.plot(0, 0, 'ro', markersize=8)

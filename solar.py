@@ -22,6 +22,7 @@ class SolarPosition:
     azimuth: float
     elevation: float              # apparent (refraction-corrected) centre
     geometric_elevation: float    # geometric centre
+    declination: float = 0.0      # degrees; latitude of the sub-solar point
 
 
 @dataclass(frozen=True)
@@ -146,7 +147,29 @@ def solar_position(latitude: float, longitude: float, when: datetime) -> SolarPo
     )
     azimuth = (azimuth + 180.0) % 360.0
 
-    return SolarPosition(azimuth=azimuth, elevation=elevation, geometric_elevation=geometric_elevation)
+    return SolarPosition(azimuth=azimuth, elevation=elevation, geometric_elevation=geometric_elevation,
+                         declination=declination)
+
+
+EARTH_ANGULAR_VELOCITY = 2.0 * math.pi / 86164.0905  # rad/s (sidereal rotation)
+
+
+def last_light_delay(latitude: float, declination: float, r_earth: float, h: float, ha: float) -> timedelta:
+    """Time after (ground) sunset at which the last ray still reaches a cloud base at height `h`.
+
+    The last ray grazes the top of the aerosol layer (height `ha`, radius R + ha) before reaching the
+    cloud base (radius R + h), so the Sun is then arccos(x) below the horizontal at the cloud, with
+    x = (R + ha) / (R + h). With phi = latitude and alpha = declination (the sub-solar latitude):
+
+        delay = [asin(tan(phi) tan(alpha) + sqrt(1 - x^2) sec(phi) sec(alpha)) - asin(tan(phi) tan(alpha))] / omega
+    """
+    phi, alpha = math.radians(latitude), math.radians(declination)
+    x = (r_earth + ha) / (r_earth + h)
+    base = math.tan(phi) * math.tan(alpha)
+    late = base + math.sqrt(max(0.0, 1.0 - x * x)) / (math.cos(phi) * math.cos(alpha))
+    if abs(base) > 1.0 or late > 1.0:  # polar day/night: the Sun never reaches that depression
+        return timedelta(0)
+    return timedelta(seconds=(math.asin(late) - math.asin(base)) / EARTH_ANGULAR_VELOCITY)
 
 
 def sun_event(

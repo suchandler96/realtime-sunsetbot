@@ -38,6 +38,8 @@ BASE = "https://data.nsmc.org.cn/DataPortal"
 USER_AGENT = "fy4nsmc/1.0 (personal data download script)"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SESSION_FILE = os.path.join(HERE, ".nsmc_session.json")
+# Picked up automatically when it exists: username on line 1, password on line 2.
+DEFAULT_CREDENTIALS_FILE = os.path.join(HERE, "nsmc_credentials.txt")
 DEFAULT_PRODUCTS = ["CTH", "CTT"]  # cloud top height, cloud top temperature
 SATELLITE, INSTRUMENT, AREA = "FY4B", "AGRI", "DISK"
 DOWNLOAD_SOURCE = "NewPortalCH"  # what the Chinese web page sends
@@ -327,7 +329,10 @@ def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, 
             if not portal.logged_in():
                 cached = use_session_cache and portal.load_session(session_file)
                 if not cached:
+                    credentials_file = credentials_file or (
+                        DEFAULT_CREDENTIALS_FILE if os.path.isfile(DEFAULT_CREDENTIALS_FILE) else None)
                     if credentials_file:
+                        print(f"Using login credentials from {credentials_file}")
                         username, password = read_credentials(credentials_file)
                     else:
                         username = os.environ.get("NSMC_USER") or input("data.nsmc.org.cn user name: ").strip()
@@ -366,7 +371,8 @@ def main():
     ap.add_argument("--search-only", action="store_true", help="list the files, do not download")
     ap.add_argument("--session-file", default=DEFAULT_SESSION_FILE, help="cached login cookies")
     ap.add_argument("--no-session-cache", action="store_true", help="do not read or write the session file")
-    ap.add_argument("--credentials-file", help="text file: user name on line 1, password on line 2")
+    ap.add_argument("--credentials-file", help="text file: user name on line 1, password on line 2 "
+                                               "(default: nsmc_credentials.txt next to this script, if it exists; else NSMC_USER/NSMC_PASS or a prompt)")
     args = ap.parse_args()
 
     _, failures = fetch_newest(

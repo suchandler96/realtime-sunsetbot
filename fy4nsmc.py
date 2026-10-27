@@ -91,6 +91,90 @@ def _input_value(html, element_id):
     return m.group(1) if m else ""
 
 
+CAPTCHA_LENGTH = 4
+CAPTCHA_MARGIN = 2        # white columns kept between a character and the edge of its crop
+CAPTCHA_MAX_CROSSED = 2   # a cut may cross at most this many black pixels
+CAPTCHA_SIMILAR = 20      # RGB (Euclidean) distance below which two pixels count as the same colour
+CAPTCHA_PRINT_INTERMEDIATE_IMG = False  # save the denoised, binarised and per-character images next to the captcha
+
+
+def _denoise(image):
+    """Replace a pixel by the background colour unless it continues a similar colour both
+    horizontally (left or right neighbour) and vertically (upper or lower neighbour).
+
+    image: (height, width, 3) colour image; two pixels are similar when their distance in RGB
+    space is below CAPTCHA_SIMILAR.  The background colour is the per-channel median.
+    """
+    import numpy as np
+    bg = np.median(image.reshape(-1, 3), axis=0).astype(image.dtype)
+    padded = np.pad(image.astype(float), ((1, 1), (1, 1), (0, 0)))
+    padded[0], padded[-1], padded[:, 0], padded[:, -1] = bg, bg, bg, bg
+    centre = image.astype(float)
+
+    def similar(rows, cols):
+        return np.linalg.norm(padded[rows, cols] - centre, axis=2) < CAPTCHA_SIMILAR
+
+    inner, before, after = slice(1, -1), slice(0, -2), slice(2, None)
+    horizontal = similar(inner, before) | similar(inner, after)
+    vertical = similar(before, inner) | similar(after, inner)
+    cleaned = image.copy()
+    cleaned[~(horizontal & vertical)] = bg
+    return cleaned
+
+
+def _split_columns(binary, parts=CAPTCHA_LENGTH):
+    """Cut the binarised image (black text = 0) into `parts` crops along the columns.
+
+    Each cut is searched around the equal-width position: columns crossing at most
+    CAPTCHA_MAX_CROSSED black pixels win, then the one with the fewest black pixels within
+    CAPTCHA_MARGIN columns of it, then the one nearest to the equal-width position.  A crop whose
+    text lies closer than CAPTCHA_MARGIN pixels to a side is padded with white.
+    """
+    import numpy as np
+    import cv2
+    height, width = binary.shape
+    ink = (binary == 0).sum(axis=0)
+    reach = max(1, width // (2 * parts))
+    cuts = [0]
+    for k in range(1, parts):
+        ideal = round(width * k / parts)
+        window = range(max(cuts[-1] + 1, ideal - reach), min(width - 1, ideal + reach) + 1)
+        cuts.append(min(window, key=lambda c: (ink[c] > CAPTCHA_MAX_CROSSED,
+                                               ink[max(0, c - CAPTCHA_MARGIN):c + CAPTCHA_MARGIN + 1].sum(),
+                                               abs(c - ideal))))
+    cuts.append(width)
+    crops = []
+    for a, b in zip(cuts, cuts[1:]):
+        crop = binary[:, a:b]
+        columns = np.flatnonzero((crop == 0).any(axis=0))
+        left = max(0, CAPTCHA_MARGIN - columns[0]) if len(columns) else CAPTCHA_MARGIN
+        right = max(0, CAPTCHA_MARGIN - (crop.shape[1] - 1 - columns[-1])) if len(columns) else CAPTCHA_MARGIN
+        crops.append(cv2.copyMakeBorder(crop, 0, 0, left, right, cv2.BORDER_CONSTANT, value=255))
+    return crops
+
+
+def solve_captcha(image_path):
+    """OCR the captcha: denoise, binarise (Otsu), split into one image per character, read each."""
+    import cv2
+    import pytesseract
+    from PIL import Image
+
+    denoised = _denoise(cv2.imread(image_path))  # BGR vs RGB does not change distances
+    gray = cv2.cvtColor(denoised, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    crops = _split_columns(binary)
+    if CAPTCHA_PRINT_INTERMEDIATE_IMG:
+        stem = os.path.splitext(image_path)[0]
+        cv2.imwrite(f"{stem}_denoised.png", denoised)
+        cv2.imwrite(f"{stem}_binary.png", binary)
+        for i, crop in enumerate(crops, 1):
+            cv2.imwrite(f"{stem}_char{i}.png", crop)
+    # --psm 10: a single character; the whitelist excludes punctuation and spaces
+    config = r'--oem 3 --psm 10 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    return "".join(pytesseract.image_to_string(Image.fromarray(crop), config=config).strip()
+                   for crop in crops)
+
+
 class PortalError(RuntimeError):
     pass
 
@@ -185,7 +269,7 @@ class Portal:
             raise PortalError("could not find the login key / public key on the sign-in page")
         return form, page.url.split("/v1/user/login")[0] + "/v1/user"  # https://.../authcenter/v1/user
 
-    def login(self, username, password, attempts=4):
+    def login(self, username, password, attempts=8):
         """Sign in through the portal's auth centre (the same page the browser is sent to)."""
         for attempt in range(1, attempts + 1):
             form, auth = self._signin_page()  # fresh page (and keys) for every attempt
@@ -200,39 +284,6 @@ class Portal:
             shown = time.time()
             # code = self._ask_code()
 
-            import cv2
-            import pytesseract
-            from PIL import Image
-
-            def solve_captcha(image_path):
-                # 2. 读取图片并转为灰度图
-                img = cv2.imread(image_path)
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-                # 3. 预处理：二值化（使用 OTSU 自动阈值，比固定阈值更稳）
-                # 如果背景干净，也可以直接用 _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-                mask = (binary[:, 1:-1] == 0) & (binary[:, :-2] == 255) & (binary[:, 2:] == 255)
-                binary[:, 1:-1][mask] = 255
-                mask_h = (binary[1:-1, :] == 0) & (binary[:-2, :] == 255) & (binary[2:, :] == 255)
-                binary[1:-1, :][mask_h] = 255
-                # cv2.imwrite(self.captcha_path[:-4] + "_denoised" + self.captcha_path[-4:], binary)
-
-                # 可选：放大图像（Tesseract 对小字符识别差，放大 2 倍通常有帮助）
-                # binary = cv2.resize(binary, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-
-                # 4. 转为 PIL Image 格式供 pytesseract 使用
-                pil_img = Image.fromarray(binary)
-
-                # 5. 关键配置：限定字符集和分割模式
-                # --psm 8: 将图像视为单个单词，适合验证码这种孤立字符
-                # tessedit_char_whitelist: 限定只识别你期望的字符，排除标点、空格等干扰
-                custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
-
-                # 6. 执行识别
-                text = pytesseract.image_to_string(pil_img, config=custom_config)
-                return text.strip()
             code = solve_captcha(self.captcha_path)
             print("OCR result:", code)
 

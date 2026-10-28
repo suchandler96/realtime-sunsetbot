@@ -24,9 +24,11 @@ import base64
 import getpass
 import json
 import os
+import queue
 import re
 import secrets
 import sys
+import threading
 import time
 import uuid
 from html import unescape as html_unescape
@@ -40,6 +42,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SESSION_FILE = os.path.join(HERE, ".nsmc_session.json")
 # Picked up automatically when it exists: username on line 1, password on line 2.
 DEFAULT_CREDENTIALS_FILE = os.path.join(HERE, "nsmc_credentials.txt")
+DOWNLOAD_STALL_S = 5  # a file download that receives no data for this long counts as failed
 DEFAULT_PRODUCTS = ["CTH", "CTT"]  # cloud top height, cloud top temperature
 SATELLITE, INSTRUMENT, AREA = "FY4B", "AGRI", "DISK"
 DOWNLOAD_SOURCE = "NewPortalCH"  # what the Chinese web page sends
@@ -266,11 +269,49 @@ class Portal:
             if "json" in ctype or "html" in ctype:
                 raise PortalError(f"server answered with {ctype}: {resp.text[:200]!r}")
             started = time.time()
-            with open(part, "wb") as f:
-                for chunk in resp.iter_content(1 << 20):
-                    f.write(chunk)
-                    if time.time() - started > deadline_s:
-                        raise PortalError(f"download exceeded {deadline_s}s")
+            # A reader thread feeds the file loop, so a stalled connection (no bytes at all in
+            # DOWNLOAD_STALL_S seconds) is noticed even while a read is blocked.
+            chunks, stop = queue.Queue(maxsize=16), threading.Event()
+
+            def pump():
+                try:
+                    for chunk in resp.iter_content(1 << 16):
+                        while not stop.is_set():
+                            try:
+                                chunks.put(chunk, timeout=1)
+                                break
+                            except queue.Full:
+                                pass
+                    outcome = None
+                except Exception as exc:
+                    outcome = exc
+                while not stop.is_set():
+                    try:
+                        chunks.put(outcome, timeout=1)
+                        break
+                    except queue.Full:
+                        pass
+
+            threading.Thread(target=pump, daemon=True).start()
+            try:
+                with open(part, "wb") as f:
+                    while True:
+                        left = deadline_s - (time.time() - started)
+                        if left <= 0:
+                            raise PortalError(f"download exceeded {deadline_s}s")
+                        try:
+                            chunk = chunks.get(timeout=min(DOWNLOAD_STALL_S, left))
+                        except queue.Empty:
+                            if time.time() - started >= deadline_s:
+                                raise PortalError(f"download exceeded {deadline_s}s")
+                            raise PortalError(f"no data received for {DOWNLOAD_STALL_S}s (download stalled)")
+                        if chunk is None:
+                            break
+                        if isinstance(chunk, Exception):
+                            raise chunk
+                        f.write(chunk)
+            finally:
+                stop.set()
             size, expected = os.path.getsize(part), int(float(row.get("DATASIZE") or 0))
             if expected and size != expected:
                 raise PortalError(f"size {size} != expected {expected}")

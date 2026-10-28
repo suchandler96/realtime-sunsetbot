@@ -1,0 +1,39 @@
+# Copy to email/config.toml (git-ignored) and fill in.  Passwords/keys are NOT stored here:
+# they are read from the environment variables named below.
+
+[imap]
+host = "imap.example.com"
+port = 993
+user = "sunsetbot@example.com"
+password_env = "SUNSETBOT_MAIL_PASSWORD"
+folder = "INBOX"
+
+[smtp]
+host = "smtp.example.com"
+port = 465                       # 465 = implicit TLS, anything else = STARTTLS
+user = "sunsetbot@example.com"   # also used as the From address
+password_env = "SUNSETBOT_MAIL_PASSWORD"
+
+[service]
+# Only these senders get an answer; others are ignored silently.  Full addresses or "@domain".
+allowed_senders = ["me@example.com"]
+# Reject mails whose Authentication-Results header lacks dkim=pass (From: can be forged).
+require_dkim_pass = false
+poll_seconds = 60
+max_requests_per_hour = 6        # per sender
+run_timeout_seconds = 900        # kill main.py after this long
+max_output_chars = 20000         # stdout kept in the reply
+# false: main.py is started without --silent, so the figure also opens in a window on this machine
+# (the run then waits until the window is closed or run_timeout_seconds passes).  true: headless.
+silent = true
+# "subprocess": main.py in a separate Python (time limit, isolated crashes); "inprocess": runpy inside the
+# service process (see runner_inprocess.py; no time limit)
+runner = "subprocess"
+# Costly / interactive data sources.  The FY-4B satellite layer logs in to the NSMC portal.
+allow_satellite = false
+
+# [llm] is only used when NATURAL_LANGUAGE is enabled in request_parser.py
+[llm]
+# Optional: understand free-form requests with Claude.  Without a key the rule-based parser is used.
+api_key_env = "ANTHROPIC_API_KEY"
+model = "claude-haiku-5-5"

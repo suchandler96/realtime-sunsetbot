@@ -10,7 +10,7 @@ from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
 
-from solar import sun_event, last_light_delay
+from solar import sun_event, last_light_delay, grazing_height
 from weather_data import DataSource, WeatherData
 from cities import get_city, custom_city, CITIES
 from satellite import get_source, SOURCES
@@ -392,9 +392,12 @@ def earliest_light_y(x, h):
     return h + 0.5 * (R_EARTH + h) * s**2 * (1.0 + 5.0 * s**2 / 12.0)
 
 
-def latest_light_y(x, h):
-    """最晚还能照到云底的光线：与气溶胶层顶 (半径 R+ha) 相切，并经过 (0, h)。"""
-    ha = min(HA_KM, h)  # 若云底低于气溶胶层顶，则最晚光线退化为与地表相切
+def latest_light_y(x, h, ha=None):
+    """最晚还能照到云底的光线：与气溶胶层顶 (半径 R+ha) 相切，并经过 (0, h)。
+
+    ha 为光线最低点的高度，缺省为气溶胶层顶；中间光线传入介于 0 与层顶之间的值。"""
+    if ha is None:
+        ha = min(HA_KM, h)  # 若云底低于气溶胶层顶，则最晚光线退化为与地表相切
     theta = math.acos((R_EARTH + ha) / (R_EARTH + h))
     s = theta - x / R_EARTH
     return ha + (R_EARTH + ha) * 0.5 * s**2 * (1.0 + 5.0 * s**2 / 12.0)
@@ -419,7 +422,22 @@ ax.plot(sun_side_x, aerosol_ray_y, color='crimson', linestyle='--', linewidth=2,
         label=f'{aerosol_ray_name} light to cloud base')
 
 
-def label_ray_time(x, y, when, color, side, top_km=15.3):
+INTERMEDIATE_RAY_STEP_MIN = 5   # 中间光线的时间间隔 (从日出/日落时刻起算)
+INTERMEDIATE_RAY_GAP_MIN = 2    # 最后一条中间光线与气溶胶光线至少相隔的分钟数
+step = timedelta(minutes=INTERMEDIATE_RAY_STEP_MIN)
+direction = 1 if EVENT == "sunset" else -1
+intermediate_rays = []  # (time, ray height)
+delay = step
+while delay <= aerosol_ray_delay - timedelta(minutes=INTERMEDIATE_RAY_GAP_MIN):
+    grazing = grazing_height(city.latitude, sun.position.declination, R_EARTH, local_cbh_km, delay)
+    intermediate_rays.append((ground_ray_time + direction * delay, latest_light_y(sun_side_x, local_cbh_km, grazing)))
+    delay += step
+for i, (when, y) in enumerate(intermediate_rays):
+    ax.plot(sun_side_x, y, color='darkgoldenrod', linestyle=':', linewidth=1.2,
+            label=f'Intermediate light (every {INTERMEDIATE_RAY_STEP_MIN} min)' if i == 0 else None)
+
+
+def label_ray_time(x, y, when, color, side, top_km=15.3, **text):
     """Write the ray's clock time beside it near the top of the figure (side: 'left' or 'right' of the ray)."""
     inside = np.where(y <= top_km)[0]
     if len(inside) == 0:
@@ -427,11 +445,13 @@ def label_ray_time(x, y, when, color, side, top_km=15.3):
     i = inside[-1]  # far end of the ray still inside the axes
     ax.annotate(f"{when:%H:%M}", (x[i], y[i]), xytext=(6 if side == "right" else -6, 0),
                 textcoords="offset points", ha="left" if side == "right" else "right", va="center",
-                color=color, fontsize=11, fontweight="bold")
+                color=color, **{"fontsize": 11, "fontweight": "bold", **text})
 
 
 label_ray_time(sun_side_x, ground_ray_y, ground_ray_time, 'darkorange', "left")
 label_ray_time(sun_side_x, aerosol_ray_y, aerosol_ray_time, 'crimson', "right")
+for when, y in intermediate_rays:
+    label_ray_time(sun_side_x, y, when, 'darkgoldenrod', "right", fontsize=8, fontweight="normal")
 
 # 4.3 标记核心元素
 ax.plot(0, 0, 'ro', markersize=8)

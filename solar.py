@@ -172,6 +172,21 @@ def last_light_delay(latitude: float, declination: float, r_earth: float, h: flo
     return timedelta(seconds=(math.asin(late) - math.asin(base)) / EARTH_ANGULAR_VELOCITY)
 
 
+def grazing_height(latitude: float, declination: float, r_earth: float, h: float, delay: timedelta) -> float:
+    """Lowest height (same unit as `r_earth`) of the ray reaching a cloud base at `h`, `delay` after sunset.
+
+    Inverse of `last_light_delay`: that ray is tangent to the sphere of radius R + g with
+    g = (R + h) cos(theta), where theta is the Sun's depression below the horizontal at the cloud.
+    """
+    phi, alpha = math.radians(latitude), math.radians(declination)
+    base = math.tan(phi) * math.tan(alpha)
+    if abs(base) > 1.0:
+        return 0.0
+    angle = math.asin(base) + EARTH_ANGULAR_VELOCITY * delay.total_seconds()
+    sin_theta = (math.sin(min(angle, math.pi / 2)) - base) * math.cos(phi) * math.cos(alpha)
+    return (r_earth + h) * math.sqrt(max(0.0, 1.0 - sin_theta * sin_theta)) - r_earth
+
+
 def sun_event(
     latitude: float,
     longitude: float,

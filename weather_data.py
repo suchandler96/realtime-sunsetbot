@@ -110,6 +110,8 @@ class OpenMeteoBackend(WeatherBackend):
             "hourly": ",".join(request._expanded_hourly_variables()),
             "models": request._source.value,
             "timezone": request._timezone,
+            # NaN = no statistical downscaling: the reported elevation is the model's own grid-cell height
+            "elevation": ",".join(["NaN"] * len(latitudes)),
         }
         if request._start_date is not None:
             params["start_date"] = request._start_date
@@ -285,6 +287,10 @@ class WeatherResult:
         if first is None:
             raise RuntimeError("no valid point data returned by the backend")
         self.times: list[str] = list(first["hourly"]["time"])
+        # Height (km) of the model's own terrain at each point (NaN if the backend does not report it).
+        self.model_elevation_km = np.asarray(
+            [float(p["elevation"]) / 1000.0 if p and p.get("elevation") is not None else np.nan
+             for p in point_payloads])
         self._time_objects = [datetime.fromisoformat(value) for value in self.times]
         self._arrays: dict[str, np.ndarray] = {}
         self._parse(point_payloads)

@@ -29,6 +29,7 @@ CITIES = [
     City("Shanghai", 31.2304, 121.4737, "Asia/Shanghai"),
     City("Beijing", 39.9042, 116.4074, "Asia/Shanghai"),
     City("Nanjing", 32.0603, 118.7969, "Asia/Shanghai"),
+    City("Chengdu", 30.6667, 104.0667, "Asia/Shanghai"),
     City("Tokyo", 35.6762, 139.6503, "Asia/Tokyo"),
     City("Taipei", 25.0330, 121.5654, "Asia/Taipei"),
     City("Seoul", 37.5665, 126.9780, "Asia/Seoul"),

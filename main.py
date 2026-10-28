@@ -16,6 +16,7 @@ from cities import get_city, custom_city, CITIES
 from satellite import get_source, SOURCES
 import fy4b
 import aerosol
+import terrain
 import fy4nsmc
 import radar
 
@@ -100,6 +101,7 @@ a_cos_phi_sq = (R_EARTH_EQUATOR * np.cos(np.radians(city.latitude))) ** 2
 b_sin_phi_sq = (R_EARTH_POLAR * np.sin(np.radians(city.latitude))) ** 2
 R_EARTH = np.sqrt((R_EARTH_EQUATOR**2 * a_cos_phi_sq + R_EARTH_POLAR**2 * b_sin_phi_sq) /
                   (a_cos_phi_sq + b_sin_phi_sq))
+INCLUDE_TERRAIN = True    # 绘制地形 (AWS terrarium DEM)，并把观测者放在本地海拔
 HA_KM = 1.0               # 气溶胶最低透光高度 (km)，可调整
 
 # 云底高度模式：True 为自动识别，False 为手动指定 MANUAL_CBH_KM
@@ -232,12 +234,39 @@ time_idx = weather.nearest_index(sun.time)
 height_km = weather.values("geopotential_height")[:, :, time_idx] / 1000.0
 height_km = np.where(np.isnan(height_km), np.asarray(ALTITUDES_KM)[:, None], height_km)
 
+# 3.0 地形：沿剖面 (1 km 间隔) 的 DEM 海拔 (km)；观测者位于 x=0 处的本地海拔
+TERRAIN_STEP_KM = 3
+terrain_distances = np.arange(X_MIN, X_MAX + TERRAIN_STEP_KM, TERRAIN_STEP_KM)
+terrain_lats, terrain_lons = zip(*(
+    get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH) for d in terrain_distances))
+terrain_km = None
+observer_km = 0.0
+if INCLUDE_TERRAIN:
+    try:
+        terrain_km = terrain.read_elevation(terrain_lats, terrain_lons)
+    except Exception as exc:  # network problems must not kill the weather figure
+        print(f"Terrain download failed ({exc}); continuing without terrain")
+    if terrain_km is not None:
+        observer_km = float(np.interp(0.0, terrain_distances, terrain_km))
+        print(f"Terrain: observer at {observer_km * 1000:.0f} m; profile {terrain_km.min() * 1000:.0f}"
+              f"-{terrain_km.max() * 1000:.0f} m")
+# 模式自身的 (平滑) 地形高度 (km)；低于它的气压层数据是外推值。
+# 图中不用 NaN 去掩盖 (会在地形附近留下白色区域)，而是让地面填充一直盖到 DEM 与模式地形中较高者；
+# 识别本地云底时则直接排除这些层。
+model_terrain_km = np.nan_to_num(weather.model_elevation_km, nan=0.0)
+underground = height_km < model_terrain_km[None, :]
+ground_top_km = None
+if terrain_km is not None:
+    ground_top_km = np.maximum(terrain_km, np.interp(terrain_distances, distances, model_terrain_km))
+    print(f"Model terrain: {model_terrain_km.min() * 1000:.0f}-{model_terrain_km.max() * 1000:.0f} m "
+          f"(observer cell {model_terrain_km[distances == 0][0] * 1000:.0f} m)")
+
 # 3.1 本地(x=0)云底高度
 if AUTO_CLOUD_BASE:
     # 自动识别：取首个相对湿度饱和或云量明显的层结
     obs_idx = np.where(distances == 0)[0][0]
-    rh_at_observer = weather.values("relative_humidity")[:, obs_idx, time_idx]
-    cloud_at_observer = weather.values("cloud_cover")[:, obs_idx, time_idx]
+    rh_at_observer = np.where(underground[:, obs_idx], np.nan, weather.values("relative_humidity")[:, obs_idx, time_idx])
+    cloud_at_observer = np.where(underground[:, obs_idx], np.nan, weather.values("cloud_cover")[:, obs_idx, time_idx])
 
     cloud_layer_mask = (rh_at_observer >= 99) | (cloud_at_observer >= 50)
     if np.any(cloud_layer_mask):
@@ -319,12 +348,13 @@ cbar.set_label('Relative Humidity (%)', fontsize=11)
 
 # 4.1b 叠加云量：云量 >= 50% 的区域以斜线阴影表示，低云也能显示出来
 ax.contourf(X, Y, cloud_matrix, levels=[50, 101], colors='none', hatches=['///'])
-ax.contour(X, Y, cloud_matrix, levels=[50], colors='dimgray', linewidths=0.6, alpha=0.7)
+ax.contour(X, Y, cloud_matrix, levels=[50], colors='dimgray', linewidths=0.6, alpha=0.7, zorder=1.2)
 
 # 4.1c 叠加等温线 (每隔 5°C)
 temp_levels = np.arange(-80, 31, 5)
 temp_contour = ax.contour(X, Y, temp_matrix, levels=temp_levels, colors='black', linewidths=0.7)
-ax.clabel(temp_contour, inline=True, fontsize=8, fmt='%d°C')
+for label in ax.clabel(temp_contour, inline=True, fontsize=8, fmt='%d°C'):
+    label.set_zorder(2.2)  # 与等值线一起位于地形之下
 
 # 4.1c2 气溶胶消光系数等值线 (CAMS, km^-1)
 aerosol_handle = None
@@ -332,7 +362,8 @@ if aerosol_profile is not None:
     aerosol_x = np.broadcast_to(distances, aerosol_height_km.shape)
     aerosol_contour = ax.contour(aerosol_x, aerosol_height_km, aerosol_profile.extinction_per_km,
                                  levels=AEROSOL_LEVELS_KM, colors='purple', linewidths=1.0, linestyles='--')
-    ax.clabel(aerosol_contour, inline=True, fontsize=8, fmt='%g')
+    for label in ax.clabel(aerosol_contour, inline=True, fontsize=8, fmt='%g'):
+        label.set_zorder(2.2)
     aerosol_handle = Line2D([0], [0], color='purple', linestyle='--', linewidth=1.0)
 
 # 4.1d 卫星云顶温度代理 (Himawari tbb_14) 沿剖面
@@ -416,9 +447,9 @@ print(f"{ground_ray_name} light to cloud base (ground-grazing ray): {ground_ray_
 
 ground_ray_y = earliest_light_y(sun_side_x, local_cbh_km)
 aerosol_ray_y = latest_light_y(sun_side_x, local_cbh_km)
-ax.plot(sun_side_x, ground_ray_y, color='darkorange', linestyle='--', linewidth=2,
+ax.plot(sun_side_x, ground_ray_y, color='darkorange', linestyle='--', linewidth=2, zorder=3,
         label=f'{ground_ray_name} light to cloud base')
-ax.plot(sun_side_x, aerosol_ray_y, color='crimson', linestyle='--', linewidth=2,
+ax.plot(sun_side_x, aerosol_ray_y, color='crimson', linestyle='--', linewidth=2, zorder=3,
         label=f'{aerosol_ray_name} light to cloud base')
 
 
@@ -433,7 +464,7 @@ while delay <= aerosol_ray_delay - timedelta(minutes=INTERMEDIATE_RAY_GAP_MIN):
     intermediate_rays.append((ground_ray_time + direction * delay, latest_light_y(sun_side_x, local_cbh_km, grazing)))
     delay += step
 for i, (when, y) in enumerate(intermediate_rays):
-    ax.plot(sun_side_x, y, color='darkgoldenrod', linestyle=':', linewidth=1.2,
+    ax.plot(sun_side_x, y, color='darkgoldenrod', linestyle=':', linewidth=1.2, zorder=3,
             label=f'Intermediate light (every {INTERMEDIATE_RAY_STEP_MIN} min)' if i == 0 else None)
 
 
@@ -454,11 +485,15 @@ for when, y in intermediate_rays:
     label_ray_time(sun_side_x, y, when, 'darkgoldenrod', "right", fontsize=8, fontweight="normal")
 
 # 4.3 标记核心元素
-ax.plot(0, 0, 'ro', markersize=8)
-ax.plot(0, local_cbh_km, 'gX', markersize=10, label=f'Local Cloud Base ({local_cbh_km:.2f} km)') # 本地云底
+ax.plot(0, observer_km, 'ro', markersize=8, zorder=6)
+ax.plot(0, local_cbh_km, 'gX', markersize=10, zorder=3, label=f'Local Cloud Base ({local_cbh_km:.2f} km)') # 本地云底
 
-# 绘制地平线遮挡提示 (低于0km视为地下)
-ax.fill_between(distances, -1, 0, color='gray', alpha=0.3, label='Ground')
+# 绘制地形 (无 DEM 时退回为 0 km 以下的灰色地面)
+if terrain_km is not None:
+    # 不透明，盖住 RH、云量、等温线与气溶胶等值线 (含低于模式地形的外推数据)，但位于光线与标记之下
+    ax.fill_between(terrain_distances, -1, ground_top_km, color='#d9d9d9', zorder=2.5, label='Ground')
+else:
+    ax.fill_between(distances, -1, 0, color='gray', alpha=0.3, label='Ground')
 
 # ==================== 5. 图表美化 ====================
 title = f"{DATE.replace('-', '')}_{city.name.replace(' ', '')}_{EVENT}_{DATA_SOURCE.name}_{DATA_UPDATE_STR}"

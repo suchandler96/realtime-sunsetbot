@@ -239,7 +239,7 @@ if AUTO_CLOUD_BASE:
     rh_at_observer = weather.values("relative_humidity")[:, obs_idx, time_idx]
     cloud_at_observer = weather.values("cloud_cover")[:, obs_idx, time_idx]
 
-    cloud_layer_mask = (rh_at_observer >= 80) | (cloud_at_observer >= 50)
+    cloud_layer_mask = (rh_at_observer >= 99) | (cloud_at_observer >= 50)
     if np.any(cloud_layer_mask):
         local_cbh_km = float(height_km[int(np.argmax(cloud_layer_mask)), obs_idx])
     else:

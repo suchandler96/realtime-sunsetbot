@@ -439,14 +439,52 @@ def latest_light_y(x, h, ha=None):
 ground_ray_time = sun.time
 aerosol_ray_delay = last_light_delay(city.latitude, sun.position.declination, R_EARTH,
                                      local_cbh_km, min(HA_KM, local_cbh_km))
+aerosol_ray_limit = "aerosol top"
+
+
+def terrain_limited_delay(delay):
+    """地形遮挡修正：气溶胶光线若落到 地形 + 气溶胶层顶 之下，则每次提前 1 分钟迭代，直到不再被遮挡。
+
+    只在上一条光线被遮挡的 x 位置上检验新光线 (光线族逐条抬高，被遮挡的 x 只会越来越少)；
+    返回 (新的延迟, 初始光线被遮挡的 x 范围 (km) 或 None, 是否在延迟 0 (最早光线) 处仍被遮挡)。"""
+    x_check = terrain_distances[terrain_distances >= 0]
+    # 气溶胶层顶不会高于观测者头顶的云底
+    ha_above_ground = min(HA_KM, max(local_cbh_km - observer_km, 0.0))
+    required = np.interp(x_check, terrain_distances, terrain_km) + ha_above_ground
+    blocked = np.where(latest_light_y(x_check, local_cbh_km) < required - 1e-9)[0]
+    if blocked.size == 0:
+        return delay, None, False
+    blocked_range = (float(x_check[blocked[0]]), float(x_check[blocked[-1]]))
+    step_back = timedelta(minutes=1)
+    while blocked.size and delay > timedelta(0):
+        delay = max(delay - step_back, timedelta(0))
+        y = latest_light_y(x_check[blocked], local_cbh_km, grazing_height(
+            city.latitude, sun.position.declination, R_EARTH, local_cbh_km, delay))
+        blocked = blocked[y < required[blocked] - 1e-9]
+    return delay, blocked_range, bool(blocked.size)
+
+
+if terrain_km is not None:
+    unblocked_delay = aerosol_ray_delay
+    aerosol_ray_delay, blocked_range, still_blocked = terrain_limited_delay(aerosol_ray_delay)
+    if blocked_range is not None:
+        aerosol_ray_limit = "terrain"
+        print(f"Aerosol-top-grazing ray ({unblocked_delay.total_seconds() / 60:.1f} min) is blocked by terrain at "
+              f"x = {blocked_range[0]:.0f}-{blocked_range[1]:.0f} km; stepping back 1 min at a time -> "
+              f"{aerosol_ray_delay.total_seconds() / 60:.1f} min")
+        if still_blocked:
+            print("Warning: even the earliest ray (at the ground-grazing time) is blocked by terrain.")
 aerosol_ray_time = ground_ray_time + (aerosol_ray_delay if EVENT == "sunset" else -aerosol_ray_delay)
 ground_ray_name, aerosol_ray_name = (("Earliest", "Latest") if EVENT == "sunset" else ("Latest", "Earliest"))
 print(f"{ground_ray_name} light to cloud base (ground-grazing ray): {ground_ray_time:%H:%M:%S %Z}; "
-      f"{aerosol_ray_name.lower()} (aerosol-top-grazing ray): {aerosol_ray_time:%H:%M:%S %Z} "
+      f"{aerosol_ray_name.lower()} ({aerosol_ray_limit}-grazing ray): {aerosol_ray_time:%H:%M:%S %Z} "
       f"({aerosol_ray_delay.total_seconds() / 60:.1f} min {'after sunset' if EVENT == 'sunset' else 'before sunrise'})")
 
 ground_ray_y = earliest_light_y(sun_side_x, local_cbh_km)
-aerosol_ray_y = latest_light_y(sun_side_x, local_cbh_km)
+aerosol_ray_y = latest_light_y(
+    sun_side_x, local_cbh_km,
+    None if aerosol_ray_limit == "aerosol top" else grazing_height(
+        city.latitude, sun.position.declination, R_EARTH, local_cbh_km, aerosol_ray_delay))
 ax.plot(sun_side_x, ground_ray_y, color='darkorange', linestyle='--', linewidth=2, zorder=3,
         label=f'{ground_ray_name} light to cloud base')
 ax.plot(sun_side_x, aerosol_ray_y, color='crimson', linestyle='--', linewidth=2, zorder=3,

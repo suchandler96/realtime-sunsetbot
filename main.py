@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone, date
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.colors import BoundaryNorm, ListedColormap, LogNorm
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
 
@@ -61,6 +61,13 @@ def parse_args() -> argparse.Namespace:
                         help="how a transect point's FY-4B cloud-top height is taken from the 3x3 pixels around "
                              "its nearest pixel (valid pixels only): nearest = that pixel; max / median / mean; "
                              "weighted = mean weighted by the retrieval-quality flag")
+    parser.add_argument("--clm-file", default="",
+                        help="optional local FY-4B CLM .nc file (cloud mask) for the cloud strip; "
+                             "without it the newest CLM file is downloaded (like the CTH file)")
+    parser.add_argument("--cloud-strip", action=argparse.BooleanOptionalAction, default=True,
+                        help="with --satellite-source fy4b, add a strip of the FY-4B cloud mask and cloud optical "
+                             "thickness under the figure (downloads the newest CLM and CPD files) and break the "
+                             "cloud-top line where there is no cloud")
     parser.add_argument("--auto-cpd", action=argparse.BooleanOptionalAction, default=False,
                         help="with the automatic FY-4B download, also fetch the newest CPD file "
                              "(cloud optical thickness, daytime only) for the cloud-products transect figure")
@@ -122,6 +129,9 @@ SATELLITE_SOURCE = args.satellite_source
 SATELLITE_FILE = args.satellite_file
 CPD_FILE = args.cpd_file
 AUTO_CPD = args.auto_cpd
+CLM_FILE = args.clm_file
+CLOUD_STRIP = args.cloud_strip
+COT_FILE = CPD_FILE  # the file the cloud strip takes COT from (CPD_FILE itself only enables the companion figure)
 CTH_METHOD = args.cth_method
 
 # 雷达反射率开关
@@ -164,6 +174,7 @@ SUN_ELEVATION = sun.position.geometric_elevation  # 负值表示太阳在地平�
 X_MIN, X_MAX = -100, 900
 STEP_KM = 20
 RADAR_STEP_KM = 1  # radar pixels are ~1.4-2.4 km, so sample the radar much finer than the model grid
+FY4B_STEP_KM = 4   # FY-4B L2 pixels are 4 km, so sample the satellite at its native resolution
 
 distances = np.arange(X_MIN, X_MAX + STEP_KM, STEP_KM)
 radar_distances = np.arange(X_MIN, X_MAX + RADAR_STEP_KM, RADAR_STEP_KM)
@@ -198,6 +209,11 @@ for d in distances:
     lats.append(pt_lat)
     lons.append(pt_lon)
 
+# 卫星采样点：FY-4B 用其原生分辨率，其余数据源保持模式网格间距 (Himawari 的采样逐点扫描整幅图，较慢)
+satellite_step_km = FY4B_STEP_KM if SATELLITE_SOURCE == "fy4b" else STEP_KM
+satellite_distances = np.arange(X_MIN, X_MAX + satellite_step_km, satellite_step_km)
+satellite_lats, satellite_lons = zip(*(
+    get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH) for d in satellite_distances))
 radar_lats, radar_lons = zip(*(
     get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH) for d in radar_distances))
 
@@ -284,21 +300,50 @@ temp_matrix = weather.values("temperature")[:, :, time_idx]
 # 3.3 卫星云顶信息：通过 SATELLITE_SOURCE 选择数据源，并沿剖面采样 (可选)
 cloud_top_temp_c = None
 cloud_top_alt_km = None
+cloud_state = None
 if INCLUDE_SATELLITE:
     if SATELLITE_SOURCE == "fy4b" and not SATELLITE_FILE:
         # No file given: fetch the newest FY-4B file(s) from the NSMC portal (login session is cached).
-        wanted = ["CTH"] + (["CPD"] if AUTO_CPD and not CPD_FILE else [])
+        downloaded = {}
         try:
-            downloaded, _ = fy4nsmc.fetch_newest(wanted)
+            portal = fy4nsmc.Portal()  # shared, so the login is done once
+            if not SATELLITE_FILE:
+                downloaded.update(fy4nsmc.fetch_newest(["CTH"], portal=portal)[0])
+                SATELLITE_FILE = (downloaded.get("CTH") or [""])[0]
+            # CLM / CPD: the files closest in time to the CTH file, so that the three products describe the same clouds
+            companions = (["CLM"] if CLOUD_STRIP and not CLM_FILE else []) \
+                         + (["CPD"] if (AUTO_CPD or CLOUD_STRIP) and not CPD_FILE else [])
+            if companions and SATELLITE_FILE:
+                downloaded.update(fy4nsmc.fetch_newest(
+                    companions, portal=portal, reference_time=fy4nsmc.file_start_time(SATELLITE_FILE))[0])
         except Exception as exc:  # network / login problems must not kill the weather figure
             print(f"FY-4B download failed ({exc}); continuing without it")
-            downloaded = {}
-        SATELLITE_FILE = (downloaded.get("CTH") or [""])[0]
-        CPD_FILE = CPD_FILE or (downloaded.get("CPD") or [""])[0]
+        CLM_FILE = CLM_FILE or (downloaded.get("CLM") or [""])[0]
+        COT_FILE = CPD_FILE or (downloaded.get("CPD") or [""])[0]
+        if AUTO_CPD:
+            CPD_FILE = COT_FILE
+    if SATELLITE_SOURCE == "fy4b" and SATELLITE_FILE:
+        cth_time = fy4nsmc.file_start_time(SATELLITE_FILE)
+        for label, path in (("CLM", CLM_FILE), ("CPD", COT_FILE)):
+            other = fy4nsmc.file_start_time(path) if path else None
+            if cth_time and other and abs((other - cth_time).total_seconds()) > 15 * 60:
+                print(f"WARNING: the {label} file is {abs((other - cth_time).total_seconds()) / 60:.0f} min "
+                      f"{'after' if other > cth_time else 'before'} the CTH file ({other:%H:%M} vs {cth_time:%H:%M} UTC); "
+                      f"clouds may have moved, so the strip and the cloud-top line can disagree at cloud edges")
     satellite_source = get_source(SATELLITE_SOURCE, CTH_METHOD)
-    cloud_top = satellite_source.read_cloud_top(sun.time, lats, lons, local_file=SATELLITE_FILE)
+    cloud_top = satellite_source.read_cloud_top(sun.time, satellite_lats, satellite_lons, local_file=SATELLITE_FILE)
     cloud_top_temp_c = cloud_top.temperature_c
     cloud_top_alt_km = cloud_top.altitude_km
+    if CLOUD_STRIP and SATELLITE_SOURCE == "fy4b" and SATELLITE_FILE and os.path.exists(SATELLITE_FILE):
+        try:
+            cloud_state = fy4b.cloud_strip(SATELLITE_FILE, CLM_FILE, COT_FILE, satellite_lats, satellite_lons)
+        except Exception as exc:  # a bad file must not kill the weather figure
+            print(f"FY-4B cloud strip failed ({exc}); continuing without it")
+        else:
+            print(f"FY-4B cloud strip: mask from {cloud_state.mask_source}, "
+                  + ("COT from " + os.path.basename(COT_FILE) if np.isfinite(cloud_state.cot).any() else "no COT values"))
+            if cloud_top_alt_km is not None:  # no cloud -> no cloud top: break the line there
+                cloud_top_alt_km = np.where(cloud_state.state == 0, np.nan, cloud_top_alt_km)
 
 # 3.4 NMC 雷达组合反射率：沿剖面采样 (可选，雷达回波强 -> 云多)
 radar_dbz = None
@@ -329,13 +374,17 @@ if INCLUDE_AEROSOL:
               f"-{np.nanmax(aerosol_profile.extinction_per_km):.3g} km^-1")
 
 # ==================== 4. 绘制剖面图与模拟光路 ====================
-if radar_dbz is not None:
-    fig, (ax, ax_radar) = plt.subplots(
-        2, 1, figsize=(14, 6.8), dpi=120, sharex=True,
-        gridspec_kw={"height_ratios": [12, 1], "hspace": 0.12},
-    )
+# Strips under the main axes (same x axis): satellite cloud mask / COT first, then radar.
+strip_names = (["cloud"] if cloud_state is not None else []) + (["radar"] if radar_dbz is not None else [])
+if strip_names:
+    fig, (ax, *strip_axes) = plt.subplots(
+        1 + len(strip_names), 1, figsize=(14, 6 + 0.48 * len(strip_names)), dpi=120, sharex=True,
+        gridspec_kw={"height_ratios": [12] + [0.6] * len(strip_names), "hspace": 0.12},
+        )
+    strips = dict(zip(strip_names, strip_axes))
 else:
     fig, ax = plt.subplots(figsize=(14, 6), dpi=120)
+    strip_axes, strips = [], {}
 
 # 4.1 绘制相对湿度背景色 (与 ExampleProfile.png 色标一致)
 X = np.broadcast_to(distances, height_km.shape)
@@ -371,7 +420,7 @@ cloud_top_line = None
 if cloud_top_temp_c is not None:
     ax2 = ax.twinx()
     (cloud_top_line,) = ax2.plot(
-        distances, cloud_top_temp_c, color='navy', marker='o', markersize=2.5,
+        satellite_distances, cloud_top_temp_c, color='navy', marker='o', markersize=2.5,
         linewidth=1.2, label='Cloud-top temp proxy (°C)',
     )
     ax2.set_ylabel('Cloud-top temp proxy (°C)', fontsize=11)
@@ -379,12 +428,13 @@ if cloud_top_temp_c is not None:
 
 # 4.1e FY-4B 云顶高度沿剖面
 if cloud_top_alt_km is not None:
-    ax.plot(distances, cloud_top_alt_km, color='darkgreen',
-            marker='s', markersize=3, linewidth=1.5,
+    ax.plot(satellite_distances, cloud_top_alt_km, color='darkgreen',
+            marker='s', markersize=2, linewidth=1.0,
             label='FY-4B cloud-top height (km)')
 
 # 4.1f 雷达反射率条带 (沿剖面，色标与 NMC 图例一致；白色=无回波，灰色=雷达范围外)
 if radar_dbz is not None:
+    ax_radar = strips["radar"]
     radar_cmap = ListedColormap(radar.LEGEND_RGB / 255.0)
     radar_cmap.set_under("white")
     radar_cmap.set_bad("lightgray")
@@ -405,11 +455,39 @@ if radar_dbz is not None:
     ]
     ax_radar.set_yticks([])
     ax_radar.set_ylabel("Radar", rotation=0, ha="right", va="center")
-    ax_radar.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
     ax_radar.set_title(
         f"NMC composite reflectivity {radar_times} UTC "
-        "(NMC colours, 5-70+ dBZ; white = no echo, gray = outside mosaic)",
-        fontsize=9, loc="left")
+        "(NMC colors, 5-70+ dBZ; white: no echo, gray: not covered)",
+        fontsize=9, loc="left", pad=2)
+
+# 4.1g FY-4B 云检测 (CLM) 与云光学厚度 (COT) 条带：白色 = 无云；COT 越小颜色越浅；
+#      深灰 = 有云但无 COT 反演 (如夜间/终止线附近)；浅灰 = 无数据
+cloud_cot_cmap, cloud_cot_norm = None, None
+if cloud_state is not None:
+    ax_cloud = strips["cloud"]
+    COT_MIN, COT_MAX = 1, 100.0
+    cloud_cot_cmap = ListedColormap(plt.cm.Blues(np.linspace(0.01, 1.0, 256)))
+    cloud_cot_norm = LogNorm(COT_MIN, COT_MAX, clip=True)
+    colours = np.empty((1, len(satellite_distances), 3))
+    for k, (state, cot) in enumerate(zip(cloud_state.state, cloud_state.cot)):
+        if np.isnan(state):
+            colours[0, k] = (0.85, 0.85, 0.85)
+        elif state == 0:
+            colours[0, k] = (1.0, 1.0, 1.0)
+        elif np.isnan(cot):
+            colours[0, k] = (0.45, 0.45, 0.45)
+        else:
+            colours[0, k] = cloud_cot_cmap(cloud_cot_norm(cot))[:3]
+    half = satellite_step_km / 2
+    ax_cloud.imshow(colours, aspect="auto", interpolation="nearest",
+                    extent=(satellite_distances[0] - half, satellite_distances[-1] + half, 0, 1))
+    ax_cloud.set_yticks([])
+    ax_cloud.set_ylabel("FY-4B", rotation=0, ha="right", va="center")
+    ax_cloud.set_title(f"FY-4B cloud mask ({cloud_state.mask_source}) and cloud optical thickness "
+                       "(white: no cloud, lighter: thinner; dark gray: cloud without COT, light gray: no data)",
+                       fontsize=9, loc="left", pad=2)
+if strip_axes:
+    strip_axes[-1].set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
 
 # 4.2 计算并绘制两条边界光路 (光线追踪)
 # 展平坐标系：x 为沿地表朝向太阳的距离 (km)，y 为海拔高度 (km)。
@@ -536,7 +614,7 @@ else:
 # ==================== 5. 图表美化 ====================
 title = f"{DATE.replace('-', '')}_{city.name.replace(' ', '')}_{EVENT}_{DATA_SOURCE.name}_{DATA_UPDATE_STR}"
 ax.set_title(title, fontsize=14, fontweight='bold')
-if radar_dbz is None:
+if not strip_axes:
     ax.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
 ax.set_ylabel("Altitude (km)", fontsize=12)
 ax.set_xlim(X_MIN, X_MAX)
@@ -553,16 +631,29 @@ if aerosol_handle is not None:
     labels.append(f'Aerosol extinction {AEROSOL_WAVELENGTH} nm (km⁻¹)')
 ax.legend(handles=handles, labels=labels, loc='lower right')
 
-if radar_dbz is None:
+if not strip_axes:
     plt.tight_layout()
 else:
-    # The RH colorbar narrows the main axes; give the radar strip the same x extent
+    # The RH colorbar narrows the main axes; give the strips the same x extent
     # so the distance axes line up.
     fig.canvas.draw()
-    main_pos, radar_pos = ax.get_position(), ax_radar.get_position()
-    ax_radar.set_position([main_pos.x0, radar_pos.y0, main_pos.width, radar_pos.height])
+    main_pos = ax.get_position()
+    for strip_ax in strip_axes:
+        strip_pos = strip_ax.get_position()
+        strip_ax.set_position([main_pos.x0, strip_pos.y0, main_pos.width, strip_pos.height])
+    if cloud_cot_cmap is not None:
+        # COT color bar in the free margin beside the cloud strip
+        cloud_pos = ax_cloud.get_position()
+        cot_cax = fig.add_axes([main_pos.x1 + 0.02, cloud_pos.y0 + 0.3 * cloud_pos.height,
+                                0.09, 0.4 * cloud_pos.height])
+        cot_bar = fig.colorbar(plt.cm.ScalarMappable(norm=cloud_cot_norm, cmap=cloud_cot_cmap), cax=cot_cax,
+                               orientation="horizontal", ticks=[0.1, 1, 10, 100])
+        cot_bar.ax.set_xticklabels(["0.1", "1", "10", "100"])
+        cot_bar.ax.tick_params(labelsize=8)
+        cot_bar.set_label("COT", fontsize=8, labelpad=1)
+if radar_dbz is not None:
     # Radar legend: one horizontal row centred under the x-axis title.
-    xlabel_bb = ax_radar.xaxis.label.get_window_extent(fig.canvas.get_renderer()).transformed(
+    xlabel_bb = strip_axes[-1].xaxis.label.get_window_extent(fig.canvas.get_renderer()).transformed(
         fig.transFigure.inverted())
     fig.legend(handles=radar_handles, title="Radar reflectivity (dBZ)", loc="upper center",
                ncol=len(radar_handles), bbox_to_anchor=(main_pos.x0 + main_pos.width / 2, xlabel_bb.y0 - 0.01),

@@ -11,7 +11,9 @@ of lat/lon points; ``sample_at`` queries the CTH field at those points.
 
 from __future__ import annotations
 
+import functools
 import math
+import os
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
@@ -71,6 +73,7 @@ def _scan_angle(count: np.ndarray, offset: float, factor: float) -> np.ndarray:
     return (count - offset) / factor * _SCALE
 
 
+@functools.lru_cache(maxsize=2)  # the CTH, CLM and CPD files share one grid
 def _grid_geolocation(nx: int, ny: int) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(latitude, longitude)`` grids for the FY-4B fixed grid."""
     cols = np.arange(nx, dtype=float)
@@ -156,6 +159,74 @@ def read_cot(path: str) -> FY4BCOT:
         ds.close()
 
 
+@dataclass
+class FY4BCLM:
+    """Cloud mask product on the fixed grid."""
+
+    latitude: np.ndarray    # (nx, ny) degrees_north
+    longitude: np.ndarray   # (nx, ny) degrees_east
+    clm: np.ndarray         # (nx, ny) 0 cloudy, 1 probably cloudy, 2 probably clear, 3 clear; NaN elsewhere
+
+
+def read_clm(path: str) -> FY4BCLM:
+    """Read the CLM cloud-mask field and compute the lat/lon grids."""
+    ds = netCDF4.Dataset(path)
+    try:
+        ds.set_auto_maskandscale(False)
+        if "CLM" not in ds.variables:
+            raise KeyError(f"no CLM variable in {path} (variables: {', '.join(ds.variables)})")
+        raw = np.asarray(ds.variables["CLM"][:], dtype=float)
+        codes = np.where(np.isin(raw, (0, 1, 2, 3)), raw, np.nan)  # fill / space values are not a mask
+        lat, lon = _grid_geolocation(*codes.shape)
+        return FY4BCLM(latitude=lat, longitude=lon, clm=codes)
+    finally:
+        ds.close()
+
+
+def cloud_mask_from_dqf(dqf: np.ndarray) -> np.ndarray:
+    """Cloud-detection result stored in bits 2-3 of the CTH DQF (same codes as the CLM product)."""
+    dqf = np.asarray(dqf, dtype=float)
+    valid = np.isfinite(dqf) & (dqf < 32767)  # 32767 is the fill value
+    return np.where(valid, (np.where(valid, dqf, 0).astype(np.int64) >> 2) & 3, np.nan).astype(float)
+
+
+@dataclass
+class CloudStrip:
+    """Cloud state and optical thickness along a transect."""
+
+    state: np.ndarray   # 1 cloud (cloudy / probably cloudy), 0 no cloud (clear / probably clear), NaN no data
+    cot: np.ndarray     # cloud optical thickness; NaN where there is no cloud or no retrieval
+    mask_source: str    # "CLM" or "CTH DQF"
+
+
+def cloud_strip(cth_path: str, clm_path: str | None, cot_path: str | None, lats, lons) -> CloudStrip:
+    """Cloud mask and COT at the transect points.
+
+    The mask comes from the CLM file (nearest pixel); without one it is read from the cloud-detection bits
+    of the CTH quality flags.  COT is the median of the valid pixels of the 3x3 window around the
+    nearest pixel (5x5 where the 3x3 window has none), kept only where the mask says cloud.
+    """
+    if clm_path and os.path.exists(clm_path):
+        grid = read_clm(clm_path)
+        latitude, longitude, codes, source = grid.latitude, grid.longitude, grid.clm, "CLM"
+    else:
+        grid = read_cth(cth_path)
+        latitude, longitude, codes, source = grid.latitude, grid.longitude, cloud_mask_from_dqf(grid.dqf), "CTH DQF"
+    code = sample_window(latitude, longitude, codes, lats, lons, "nearest")
+    state = np.where(np.isnan(code), np.nan, np.where(code <= 1, 1.0, 0.0))
+    cot = np.full(len(state), np.nan)
+    if cot_path and os.path.exists(cot_path):
+        data = read_cot(cot_path)
+        cot = sample_window(data.latitude, data.longitude, data.cot, lats, lons, "median")
+        cot = np.where(state == 1, cot, np.nan)
+        # cloudy points whose 3x3 window has no valid COT: try the 5x5 window
+        retry = np.flatnonzero((state == 1) & np.isnan(cot))
+        if len(retry):
+            cot[retry] = sample_window(data.latitude, data.longitude, data.cot,
+                                       [lats[i] for i in retry], [lons[i] for i in retry], "median", half=2)
+    return CloudStrip(state=state, cot=cot, mask_source=source)
+
+
 def sample_at(
     latitude: np.ndarray,
     longitude: np.ndarray,
@@ -208,8 +279,24 @@ def sample_window(
         raise ValueError(f"unknown method '{method}' (choose from {', '.join(CTH_METHODS)})")
     vals = np.asarray(values, dtype=float)
     wts = None if weights is None else np.asarray(weights, dtype=float)
-    flat_lat = np.asarray(latitude, dtype=float).ravel()
-    flat_lon = np.asarray(longitude, dtype=float).ravel()
+    latitude = np.asarray(latitude, dtype=float)
+    longitude = np.asarray(longitude, dtype=float)
+
+    # Searching the whole disk (millions of pixels) for every point is slow once the points are dense:
+    # keep only the rectangle of pixels around the points (plus a margin for the window).
+    pts_lon = ((np.asarray(lons, dtype=float) + 180.0) % 360.0) - 180.0
+    pts_lat = np.asarray(lats, dtype=float)
+    if len(pts_lat) and np.ptp(pts_lon) < 180.0:
+        margin = 0.5  # degrees: far more than the few-pixel window needs
+        inside = ((latitude > pts_lat.min() - margin) & (latitude < pts_lat.max() + margin)
+                  & (longitude > pts_lon.min() - margin) & (longitude < pts_lon.max() + margin))
+        if inside.any():
+            rows, cols = np.flatnonzero(inside.any(axis=1)), np.flatnonzero(inside.any(axis=0))
+            crop = (slice(rows[0], rows[-1] + 1), slice(cols[0], cols[-1] + 1))
+            latitude, longitude, vals = latitude[crop], longitude[crop], vals[crop]
+            wts = None if wts is None else wts[crop]
+    flat_lat = latitude.ravel()
+    flat_lon = longitude.ravel()
 
     out = np.full(len(lats), np.nan)
     for idx, (la, lo) in enumerate(zip(lats, lons)):

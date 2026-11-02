@@ -334,10 +334,18 @@ def read_credentials(path):
     return lines[0], lines[1]
 
 
+def file_start_time(name):
+    """Observation start (UTC) from an FY-4B file name (..._<start>_<end>_4000M_...), or None."""
+    match = re.search(r"_(\d{14})_\d{14}_", os.path.basename(name))
+    return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc) if match else None
+
+
 def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, file_timeout=30,
                  session_file=DEFAULT_SESSION_FILE, use_session_cache=True, search_only=False, portal=None,
-                 credentials_file=None):
+                 credentials_file=None, reference_time=None):
     """Download the newest ``count`` files of each product; returns ``({product: [paths]}, n_failed)``.
+
+    With ``reference_time`` (UTC datetime) the files closest in time to it are taken instead of the newest.
 
     Files already present (same size) are reused without logging in.  Logging in happens only when
     something has to be downloaded: cached cookies first, otherwise an interactive prompt.
@@ -352,7 +360,12 @@ def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, 
         found[datatype] = []
         code, title = portal.product_code(datatype)
         rows = portal.search(code, begin, end, max(candidates, count))
-        print(f"\n{title}: {len(rows)} newest file(s) {begin:%Y-%m-%d} .. {end:%Y-%m-%d} UTC")
+        if reference_time is not None:  # closest to the reference first; the others are fallbacks
+            rows.sort(key=lambda r: abs((file_start_time(r["ARCHIVENAME"]) - reference_time).total_seconds()))
+            print(f"\n{title}: {len(rows)} candidate file(s) {begin:%Y-%m-%d} .. {end:%Y-%m-%d} UTC, "
+                  f"closest to {reference_time:%Y-%m-%d %H:%M} UTC first")
+        else:
+            print(f"\n{title}: {len(rows)} newest file(s) {begin:%Y-%m-%d} .. {end:%Y-%m-%d} UTC")
         for row in rows[:5]:
             print(f"   {row['DATABEGINDATE']}  {int(float(row['DATASIZE'])) / 1e6:6.1f} MB  {row['ARCHIVENAME']}")
         if not rows or search_only:

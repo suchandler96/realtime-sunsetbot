@@ -101,14 +101,17 @@ def handle(cfg, msg, limiter, dry_run_path=None):
 
 
 def poll_once(cfg, limiter):
-    done = []
+    """Handle the unseen mails; returns how many could not be answered (they stay unseen)."""
+    done, failed = [], 0
     for num, msg in mailio.fetch_unseen(cfg):
         try:
             if handle(cfg, msg, limiter):
                 done.append(num)
         except Exception as exc:  # e.g. SMTP down: leave the mail unseen to retry next round
             print(f"could not answer: {type(exc).__name__}: {exc}", file=sys.stderr)
+            failed += 1
     mailio.mark_seen(cfg, done)
+    return failed
 
 
 def main():
@@ -136,14 +139,32 @@ def main():
         return
     if not cfg.get("service", {}).get("allowed_senders"):
         sys.exit("config: service.allowed_senders must list at least one sender")
+    service = cfg.get("service", {})
+    poll_seconds = service.get("poll_seconds", 60)
+    mode = service.get("mode", "idle")
+    if mode not in ("idle", "poll"):
+        sys.exit('config: service.mode must be "idle" or "poll"')
     while True:
+        failed = 1  # a poll that raised counts as failed: retry after poll_seconds
         try:
-            poll_once(cfg, limiter)
+            failed = poll_once(cfg, limiter)
         except Exception as exc:  # network / IMAP hiccup
             print(f"poll failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         if args.once:
             break
-        time.sleep(cfg.get("service", {}).get("poll_seconds", 60))
+        if mode == "idle" and not failed:
+            started = time.monotonic()
+            try:
+                mailio.wait_for_mail(cfg, service.get("idle_seconds", 540))
+                if time.monotonic() - started < 5:
+                    time.sleep(5)  # guard against a busy loop if the server keeps reporting mail
+                continue
+            except mailio.IdleUnsupported as exc:
+                print(f"IDLE not available ({exc}); polling every {poll_seconds} s instead", file=sys.stderr)
+                mode = "poll"
+            except Exception as exc:  # connection dropped etc.: wait like a poll, then try IDLE again
+                print(f"IDLE failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        time.sleep(poll_seconds)
 
 
 if __name__ == "__main__":

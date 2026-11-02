@@ -4,7 +4,7 @@ Reads requests from a mailbox, runs `main.py` and mails back its text output and
 
     cp email/config.example.toml email/config.toml     # edit; the file is git-ignored
     export SUNSETBOT_MAIL_PASSWORD=...                 # mailbox password / app password
-    .venv_sunsetbot/bin/python email/service.py        # poll forever (--once: single pass)
+    .venv_sunsetbot/bin/python email/service.py        # run forever: IDLE push or polling, see [service] mode (--once: single pass)
 
 Requests are `key: value` lines (see `USAGE` in `request_parser.py`):
 

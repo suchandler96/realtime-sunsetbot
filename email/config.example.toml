@@ -19,6 +19,11 @@ password_env = "SUNSETBOT_MAIL_PASSWORD"
 allowed_senders = ["me@example.com"]
 # Reject mails whose Authentication-Results header lacks dkim=pass (From: can be forged).
 require_dkim_pass = false
+# "idle": the IMAP server tells us when mail arrives (IMAP IDLE); falls back to polling if the server
+# cannot IDLE.  "poll": ask every poll_seconds.  poll_seconds is also the retry delay after an error or an
+# unanswered mail.  idle_seconds: how long one IDLE connection is held before it is renewed (< 30 min).
+mode = "idle"                    # idle or poll
+idle_seconds = 540
 poll_seconds = 60
 max_requests_per_hour = 6        # per sender
 run_timeout_seconds = 900        # kill main.py after this long

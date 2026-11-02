@@ -1,8 +1,9 @@
-"""IMAP polling, SMTP sending and message helpers."""
+"""IMAP polling / IDLE, SMTP sending and message helpers."""
 import imaplib
 import os
 import re
 import smtplib
+import socket
 import time
 from email import message_from_bytes, policy
 from email.message import EmailMessage
@@ -30,6 +31,51 @@ def _connect(imap):
         pass  # servers without ID support
     conn.select(imap.get("folder", "INBOX"))
     return conn
+
+
+class IdleUnsupported(Exception):
+    """The server has no (working) IDLE command; the caller falls back to polling."""
+
+
+def wait_for_mail(cfg, timeout):
+    """Block until the server announces new mail (IMAP IDLE, RFC 2177) or `timeout` seconds pass.
+
+    Returns True if mail is (or may be) waiting, False on timeout.  Servers drop idle connections after
+    ~30 minutes, so `timeout` should stay below that.  The connection is opened per call and closed
+    afterwards; raises IdleUnsupported if the server cannot IDLE.
+    """
+    conn = _connect(cfg["imap"])
+    try:
+        _, caps = conn.capability()  # capabilities after login may differ from the greeting's
+        if b"IDLE" not in caps[0].upper().split():
+            raise IdleUnsupported("server does not advertise IDLE")
+        # Mail that arrived between the last poll and now produces no further notice.
+        _, ids = conn.search(None, "UNSEEN")
+        if ids[0].split():
+            return True
+        conn.send(conn._new_tag() + b" IDLE\r\n")
+        reply = conn.readline()
+        if not reply.startswith(b"+"):
+            raise IdleUnsupported(f"IDLE refused: {reply.decode(errors='replace').strip()}")
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            conn.sock.settimeout(left)
+            try:
+                line = conn.readline()
+            except (TimeoutError, socket.timeout):
+                return False
+            if not line or line.startswith(b"* BYE"):
+                raise imaplib.IMAP4.abort("connection closed by server")
+            if re.match(rb"\* \d+ EXISTS", line):
+                return True
+    finally:
+        try:
+            conn.shutdown()  # closing is enough; a timed-out read leaves the stream unusable for DONE
+        except Exception:
+            pass
 
 
 def fetch_unseen(cfg):

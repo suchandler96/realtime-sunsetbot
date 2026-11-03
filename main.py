@@ -16,6 +16,7 @@ from cities import get_city, custom_city, CITIES
 from satellite import get_source, SOURCES
 import fy4b
 import aerosol
+import raytrace
 import terrain
 import fy4nsmc
 import radar
@@ -80,6 +81,11 @@ def parse_args() -> argparse.Namespace:
                              "(needs an ADS account: ~/.cdsapirc and the dataset licence accepted)")
     parser.add_argument("--aerosol-wavelength", type=int, default=532, choices=aerosol.WAVELENGTHS_NM,
                         help="wavelength (nm) of the aerosol extinction coefficient")
+    parser.add_argument("--transmittance", action=argparse.BooleanOptionalAction, default=True,
+                        help="integrate the extinction (cloud, aerosol, Rayleigh) along each light ray and show its "
+                             "direct transmittance next to the ray time")
+    parser.add_argument("--ray-min-transmittance", type=float, default=0.001,
+                        help="threshold for reporting direct transmission; cloud checks continue over the full ray")
     parser.add_argument("--save", action=argparse.BooleanOptionalAction, default=False,
                         help="save the figure to a PNG file")
     parser.add_argument("--silent", action=argparse.BooleanOptionalAction, default=False,
@@ -140,6 +146,7 @@ RADAR_FILE = args.radar_file
 
 # 气溶胶消光系数开关
 INCLUDE_AEROSOL = args.aerosol
+RAY_MIN_TRANSMITTANCE = args.ray_min_transmittance
 AEROSOL_WAVELENGTH = args.aerosol_wavelength
 AEROSOL_LEVELS_KM = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]  # iso-line values of the extinction coefficient (km^-1)
 
@@ -286,7 +293,20 @@ if AUTO_CLOUD_BASE:
 
     cloud_layer_mask = (rh_at_observer >= 99) | (cloud_at_observer >= 50)
     if np.any(cloud_layer_mask):
-        local_cbh_km = float(height_km[int(np.argmax(cloud_layer_mask)), obs_idx])
+        k = int(np.argmax(cloud_layer_mask))
+        local_cbh_km = float(height_km[k, obs_idx])
+        # 云底位于首个有云层与其下方晴空层之间：按阈值穿越位置线性插值 (与图中云区边界一致)
+        if k > 0 and not np.isnan(rh_at_observer[k - 1]):
+            crossings = []
+            for below, here, threshold in ((rh_at_observer[k - 1], rh_at_observer[k], 99.0),
+                                           (cloud_at_observer[k - 1], cloud_at_observer[k], 50.0)):
+                if here >= threshold > below:
+                    crossings.append(height_km[k - 1, obs_idx]
+                                     + (threshold - below) / (here - below) * (height_km[k, obs_idx] - height_km[k - 1, obs_idx]))
+            if crossings:
+                local_cbh_km = float(min(crossings))
+                print(f"Local cloud base: {local_cbh_km:.2f} km (interpolated; first cloudy level at "
+                      f"{height_km[k, obs_idx]:.2f} km)")
     else:
         local_cbh_km = 6.0  # 晴空无云时，默认设定一个高空火烧云幕布高度
 else:
@@ -558,47 +578,109 @@ print(f"{ground_ray_name} light to cloud base (ground-grazing ray): {ground_ray_
       f"{aerosol_ray_name.lower()} ({aerosol_ray_limit}-grazing ray): {aerosol_ray_time:%H:%M:%S %Z} "
       f"({aerosol_ray_delay.total_seconds() / 60:.1f} min {'after sunset' if EVENT == 'sunset' else 'before sunrise'})")
 
-ground_ray_y = earliest_light_y(sun_side_x, local_cbh_km)
-aerosol_ray_y = latest_light_y(
-    sun_side_x, local_cbh_km,
-    None if aerosol_ray_limit == "aerosol top" else grazing_height(
-        city.latitude, sun.position.declination, R_EARTH, local_cbh_km, aerosol_ray_delay))
-ax.plot(sun_side_x, ground_ray_y, color='darkorange', linestyle='--', linewidth=2, zorder=3,
-        label=f'{ground_ray_name} light to cloud base')
-ax.plot(sun_side_x, aerosol_ray_y, color='crimson', linestyle='--', linewidth=2, zorder=3,
-        label=f'{aerosol_ray_name} light to cloud base')
-
-
+# 4.2b 沿光线积分气溶胶、瑞利和冰云消光；目标以外的含水/混合相云直接遮断直射光
+extinction_model = None
+if args.transmittance:
+    extinction_model = raytrace.ProfileExtinction(
+        distances, height_km, cloud_matrix, temp_matrix, underground=underground,
+        aerosol_extinction=None if aerosol_profile is None else aerosol_profile.extinction_per_km,
+        aerosol_heights_km=aerosol_height_km, wavelength_nm=AEROSOL_WAVELENGTH)
+    if aerosol_profile is None:
+        print("Transmittance: no aerosol data (use --aerosol); only cloud and Rayleigh extinction are integrated.")
+ray_x_fine = np.arange(0.0, X_MAX + 0.5, 1.0)
+RAY_SCAN_STEP = timedelta(minutes=0.5)        # 扫描光线的时间间隔 (与地形迭代相同)
 INTERMEDIATE_RAY_STEP_MIN = 5   # 中间光线的时间间隔 (从日出/日落时刻起算)
 INTERMEDIATE_RAY_GAP_MIN = 2    # 最后一条中间光线与气溶胶光线至少相隔的分钟数
-step = timedelta(minutes=INTERMEDIATE_RAY_STEP_MIN)
 direction = 1 if EVENT == "sunset" else -1
-intermediate_rays = []  # (time, ray height)
+
+
+def ray_y_at(x, delay):
+    """日落后延迟 `delay` (日出前提前) 到达本地云底的光线高度。"""
+    if delay <= timedelta(0):
+        return earliest_light_y(x, local_cbh_km)
+    if delay >= aerosol_ray_delay:
+        return latest_light_y(x, local_cbh_km, None if aerosol_ray_limit == "aerosol top" else grazing_height(
+            city.latitude, sun.position.declination, R_EARTH, local_cbh_km, aerosol_ray_delay))
+    return latest_light_y(x, local_cbh_km, grazing_height(
+        city.latitude, sun.position.declination, R_EARTH, local_cbh_km, delay))
+
+
+def percent(t):
+    return f"{t:.0%}" if t >= 0.1 else f"{t:.1%}"
+
+
+def T_text(result):
+    """Describe cloud blockage explicitly and otherwise apply the direct-beam display threshold."""
+    if result is None:
+        return ""
+    if result.blocked_by_cloud:
+        return " blocked"
+    return f" <{percent(RAY_MIN_TRANSMITTANCE)}" if result.stopped_at_km is not None else f" {percent(result.transmittance)}"
+
+
+# 每 0.5 分钟一条光线；目标以外的含水/混合相云遮断，冰云按有限光学厚度处理
+scan_delays = [RAY_SCAN_STEP * k for k in range(int(aerosol_ray_delay / RAY_SCAN_STEP) + 1)]
+if not scan_delays or scan_delays[-1] < aerosol_ray_delay:
+    scan_delays.append(aerosol_ray_delay)
+scan_results = [None] * len(scan_delays)
+if extinction_model is not None:
+    print(f"Direct transmittance of {len(scan_delays)} light rays "
+          f"(water-cloud blocking + Beer-Lambert ice cloud/CAMS aerosol/Rayleigh); "
+          f"{percent(RAY_MIN_TRANSMITTANCE)} is a direct-beam reporting threshold, not a sunset-glow boundary:")
+    scan_results = [extinction_model.integrate(
+        ray_x_fine, ray_y_at(ray_x_fine, d),
+        tau_stop=-math.log(max(RAY_MIN_TRANSMITTANCE, 1e-6))) for d in scan_delays]
+shown = [r is None or r.transmittance >= RAY_MIN_TRANSMITTANCE for r in scan_results]
+for k, (d, r) in enumerate(zip(scan_delays, scan_results)):
+    if r is not None and (k % 10 == 0 or k == len(scan_delays) - 1 or shown[k] != shown[k - 1]):
+        stop = (f", cloud blocked at x={r.stopped_at_km:.0f} km" if r.blocked_by_cloud else
+                f", first below threshold at x={r.stopped_at_km:.0f} km" if r.stopped_at_km is not None else "")
+        transmission = ("blocked" if r.blocked_by_cloud else
+                        T_text(r).replace(" <", "< ") if r.stopped_at_km is not None else
+                        "= " + percent(r.transmittance))
+        print(f"  {ground_ray_time + direction * d:%H:%M:%S}: T {transmission} R/G/B {'/'.join(percent(t) for t in r.rgb_transmittance)} (tau cloud {r.tau_cloud:.2f}, "
+              f"aerosol {r.tau_aerosol:.2f}, Rayleigh {r.tau_rayleigh:.2f}){stop}"
+              f"{'' if shown[k] else '  [below direct-beam threshold]'}")
+
+# 5 分钟整数倍的中间光线：始终显示；直射透过率不是火烧云是否可见的硬边界
+step = timedelta(minutes=INTERMEDIATE_RAY_STEP_MIN)
+intermediate_rays = []  # (time, ray height, transmittance)
 delay = step
 while delay <= aerosol_ray_delay - timedelta(minutes=INTERMEDIATE_RAY_GAP_MIN):
-    grazing = grazing_height(city.latitude, sun.position.declination, R_EARTH, local_cbh_km, delay)
-    intermediate_rays.append((ground_ray_time + direction * delay, latest_light_y(sun_side_x, local_cbh_km, grazing)))
+    k = min(range(len(scan_delays)), key=lambda i: abs(scan_delays[i] - delay))
+    intermediate_rays.append((ground_ray_time + direction * delay, ray_y_at(sun_side_x, delay), scan_results[k]))
     delay += step
-for i, (when, y) in enumerate(intermediate_rays):
-    ax.plot(sun_side_x, y, color='darkgoldenrod', linestyle=':', linewidth=1.2, zorder=3,
-            label=f'Intermediate light (every {INTERMEDIATE_RAY_STEP_MIN} min)' if i == 0 else None)
 
 
-def label_ray_time(x, y, when, color, side, top_km=15.3, **text):
+def label_ray_time(x, y, when, color, side, result=None, top_km=15.3, **text):
     """Write the ray's clock time beside it near the top of the figure (side: 'left' or 'right' of the ray)."""
     inside = np.where(y <= top_km)[0]
     if len(inside) == 0:
         return
     i = inside[-1]  # far end of the ray still inside the axes
-    ax.annotate(f"{when:%H:%M}", (x[i], y[i]), xytext=(6 if side == "right" else -6, 0),
+    if result is not None:  # swatch = color of the sunlight that reaches the cloud along this ray
+        ax.plot(x[i], y[i], 's', markersize=8, markerfacecolor=result.normalized_light_colour, markeredgecolor=color,
+                markeredgewidth=0.8, zorder=4)
+    ax.annotate(f"{when:%H:%M}{T_text(result)}", (x[i], y[i]), xytext=(9 if side == "right" else -9, 0),
                 textcoords="offset points", ha="left" if side == "right" else "right", va="center",
                 color=color, **{"fontsize": 11, "fontweight": "bold", **text})
 
 
-label_ray_time(sun_side_x, ground_ray_y, ground_ray_time, 'darkorange', "left")
-label_ray_time(sun_side_x, aerosol_ray_y, aerosol_ray_time, 'crimson', "right")
-for when, y in intermediate_rays:
-    label_ray_time(sun_side_x, y, when, 'darkgoldenrod', "right", fontsize=8, fontweight="normal")
+last = len(scan_delays) - 1
+# 第一条 (贴地) 与最后一条 (气溶胶 / 地形限制) 光线始终绘出，不受透过率阈值影响
+ground_ray_y = ray_y_at(sun_side_x, scan_delays[0])
+ax.plot(sun_side_x, ground_ray_y, color='darkorange', linestyle='--', linewidth=2, zorder=3,
+        label=f'{ground_ray_name} light to cloud base')
+label_ray_time(sun_side_x, ground_ray_y, ground_ray_time, 'darkorange', "left", scan_results[0])
+if last > 0:
+    aerosol_ray_y = ray_y_at(sun_side_x, scan_delays[last])
+    ax.plot(sun_side_x, aerosol_ray_y, color='crimson', linestyle='--', linewidth=2, zorder=3,
+            label=f'{aerosol_ray_name} light to cloud base')
+    label_ray_time(sun_side_x, aerosol_ray_y, aerosol_ray_time, 'crimson', "right", scan_results[last])
+for i, (when, y, result) in enumerate(intermediate_rays):
+    ax.plot(sun_side_x, y, color='darkgoldenrod', linestyle=':', linewidth=1.2, zorder=3,
+            label=f'Intermediate light (every {INTERMEDIATE_RAY_STEP_MIN} min)' if i == 0 else None)
+    label_ray_time(sun_side_x, y, when, 'darkgoldenrod', "right", result, fontsize=8, fontweight="normal")
 
 # 4.3 标记核心元素
 ax.plot(0, observer_km, 'ro', markersize=8, zorder=6)
@@ -627,6 +709,10 @@ ax.grid(True, linestyle=':', alpha=0.5)
 handles, labels = ax.get_legend_handles_labels()
 handles.append(Patch(facecolor='none', edgecolor='dimgray', hatch='///', label='Cloud cover ≥ 50%'))
 labels.append('Cloud cover ≥ 50%')
+if extinction_model is not None:
+    handles.append(Line2D([0], [0], marker='s', linestyle='none', markersize=8, markerfacecolor='#ff9a5a',
+                          markeredgecolor='dimgray'))
+    labels.append('Color of the cloud-casting sunlight')
 if cloud_top_line is not None:
     handles.append(cloud_top_line)
     labels.append('Cloud-top temp proxy (°C)')

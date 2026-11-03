@@ -612,7 +612,11 @@ else:
     ax.fill_between(distances, -1, 0, color='gray', alpha=0.3, label='Ground')
 
 # ==================== 5. 图表美化 ====================
-title = f"{DATE.replace('-', '')}_{city.name.replace(' ', '')}_{EVENT}_{DATA_SOURCE.name}_{DATA_UPDATE_STR}"
+sun_direction = round(AZIMUTH % 360, 1) % 360  # 0-359.9 degrees clockwise from north
+name_prefix = f"{DATE.replace('-', '')}_{city.name.replace(' ', '')}_{EVENT}"
+name_suffix = f"{DATA_SOURCE.name}_{DATA_UPDATE_STR}"
+file_stem = f"{name_prefix}_{name_suffix}"
+title = f"{name_prefix}({sun_direction:.1f}°)_{name_suffix}"  # the file name stays without the direction
 ax.set_title(title, fontsize=14, fontweight='bold')
 if not strip_axes:
     ax.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
@@ -660,7 +664,7 @@ if radar_dbz is not None:
                fontsize=9, title_fontsize=9, handlelength=1.0, handleheight=0.7,
                columnspacing=0.8, handletextpad=0.4, borderpad=0.4, framealpha=0.85)
 if SAVE_FIGURE:
-    out_path = f"{title}.png"
+    out_path = f"{file_stem}.png"
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     print(f"Figure saved to {out_path}")
 
@@ -668,7 +672,7 @@ if SAVE_FIGURE:
 # 卫星源选为 fy4b 且同时给出 CTH 与 CPD 文件时，额外绘制云顶高度/光学厚度剖面图。
 if SATELLITE_SOURCE == "fy4b" and SATELLITE_FILE and CPD_FILE:
     if os.path.exists(SATELLITE_FILE) and os.path.exists(CPD_FILE):
-        companion_path = f"{title}_cloud_products.png" if SAVE_FIGURE else None
+        companion_path = f"{file_stem}_cloud_products.png" if SAVE_FIGURE else None
         fy4b.plot_transect(
             SATELLITE_FILE, CPD_FILE,
             city.latitude, city.longitude, AZIMUTH,

@@ -16,7 +16,7 @@ import requests
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT)  # appended: the project's email/ folder must never shadow the stdlib package
-from cities import CITIES  # noqa: E402
+from cities import CITIES, CityLookupError, get_city, resolve_city  # noqa: E402
 from weather_data import DataSource  # noqa: E402
 
 EVENTS = ("sunrise", "sunset")
@@ -27,9 +27,6 @@ WAVELENGTHS = (355, 532, 1064)
 NATURAL_LANGUAGE = False
 MAX_TEXT_CHARS = 4000
 DATE_RANGE_DAYS = (-3, 7)       # relative to the server's today
-CITY_ALIASES = {"上海": "Shanghai", "北京": "Beijing", "香港": "Hong Kong", "南京": "Nanjing", "东京": "Tokyo",
-                "台北": "Taipei", "首尔": "Seoul", "新加坡": "Singapore", "曼谷": "Bangkok", "伦敦": "London",
-                "纽约": "New York", "洛杉矶": "Los Angeles"}
 
 USAGE = """\
 Send the request as `key: value` lines, for example:
@@ -41,7 +38,7 @@ Send the request as `key: value` lines, for example:
     radar: yes
     aerosol: yes
 
-Keys (all optional): city ({cities}) or lat + lon (+ place_name, timezone); date (YYYY-MM-DD, today -3 .. +7 days);
+Keys (all optional): city (English in any case, or Chinese; built in: {cities}; other Chinese cities are looked up online) or lat + lon (+ place_name, timezone); date (YYYY-MM-DD, today -3 .. +7 days);
 event (sunrise / sunset); model ({models}); cloud_base (km); radar, aerosol (yes/no);
 aerosol_wavelength (355 / 532 / 1064).""".format(
     cities=", ".join(c.name for c in CITIES), models=", ".join(DATA_SOURCES))
@@ -114,7 +111,7 @@ def parse_rules(text, today=None, natural_language=NATURAL_LANGUAGE):
             m = re.search(rf"(?<![a-z]){re.escape(city.name.lower())}(?![a-z])", low)
             if m:
                 hits.append((m.start(), city.name))
-        hits += [(text.find(alias), name) for alias, name in CITY_ALIASES.items() if alias in text]
+        hits += [(text.find(c.name_zh), c.name) for c in CITIES if c.name_zh and c.name_zh in text]
         if hits:
             raw["city"] = min(hits)[1]
     if "lat" not in raw:
@@ -212,6 +209,14 @@ def _number(value, low, high, label, problems):
     return number
 
 
+def _in_table(query):
+    try:
+        get_city(query)
+        return True
+    except KeyError:
+        return False
+
+
 def validate(raw, policy=None, today=None):
     """Whitelist and range-check a loose option dict into a Request."""
     policy = policy or Policy()
@@ -221,14 +226,16 @@ def validate(raw, policy=None, today=None):
         problems.append("this does not look like a forecast request")
 
     city, lat, lon = raw.get("city"), raw.get("lat"), raw.get("lon")
-    known = {c.name.lower(): c.name for c in CITIES}
     if city:
-        name = known.get(str(city).strip().lower()) or CITY_ALIASES.get(str(city).strip())
-        if name:
-            opts["city"] = name
-        elif lat is None:
-            problems.append(f"unknown city {str(city)[:30]!r}; known: {', '.join(known.values())} "
-                            "(or give latitude and longitude)")
+        query = str(city).strip()
+        try:
+            if not re.fullmatch(r"[\w][\w .'’-]{0,39}", query):   # also keeps it from looking like an option to main.py
+                raise CityLookupError(f"unusable city name {query[:30]!r}")
+            resolved = resolve_city(query)   # table, else online lookup (cached): fails here, not inside the run
+            opts["city"] = resolved.name if _in_table(query) else query   # main.py resolves the query again
+        except CityLookupError as exc:
+            if lat is None:
+                problems.append(str(exc))
     if "city" not in opts and lat is not None:
         la, lo = _number(lat, -90, 90, "latitude", problems), _number(lon, -180, 360, "longitude", problems)
         if la is not None and lo is not None:

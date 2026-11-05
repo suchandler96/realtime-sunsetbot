@@ -4,6 +4,12 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone, date
 
+for _stream in (sys.stdout, sys.stderr):  # Chinese city names must not crash print() on a legacy (GBK/cp1252) console
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import BoundaryNorm, ListedColormap, LogNorm
@@ -12,7 +18,7 @@ from matplotlib.lines import Line2D
 
 from solar import sun_event, last_light_delay, grazing_height
 from weather_data import DataSource, WeatherData
-from cities import get_city, custom_city, CITIES
+from cities import resolve_city, custom_city, CityLookupError
 from satellite import get_source, SOURCES
 import fy4b
 import aerosol
@@ -27,8 +33,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot an atmosphere cross-section near sunrise/sunset."
     )
-    parser.add_argument("--city", default=None, choices=[c.name for c in CITIES],
-                        help="city name from cities.py (default: Shanghai, unless --lat/--lon are given)")
+    parser.add_argument("--city", default=None,
+                        help="city name, English (any case) or Chinese: cities.py first, then looked up online "
+                             "(Chinese cities; an English name shared by several cities must be given in Chinese). "
+                             "Default: Shanghai, unless --lat/--lon are given")
     parser.add_argument("--lat", type=float, default=None,
                         help="observer latitude in degrees north (-90..90); use with --lon instead of --city")
     parser.add_argument("--lon", type=float, default=None,
@@ -93,6 +101,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Latin glyphs stay DejaVu Sans; Chinese characters (city names in titles) fall back to the first CJK font found
+plt.rcParams["font.family"] = ["DejaVu Sans", "Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "PingFang SC",
+                               "WenQuanYi Micro Hei", "Source Han Sans SC"]
+
 # ==================== 1. 核心参数配置 ====================
 args = parse_args()
 if (args.lat is None) != (args.lon is None):
@@ -106,7 +118,11 @@ if args.lat is not None:
         sys.exit(str(exc))
     print(f"Observer: {city.name} ({city.latitude:.4f}, {city.longitude:.4f}), time zone {city.timezone}")
 else:
-    city = get_city(args.city or "Shanghai")
+    try:
+        city = resolve_city(args.city or "Shanghai")
+    except CityLookupError as exc:
+        sys.exit(f"Error: {exc}")
+    print(f"Observer: {city.name} ({city.latitude:.4f}, {city.longitude:.4f}), time zone {city.timezone}")
 R_EARTH_EQUATOR = 6378.1370
 R_EARTH_POLAR = 6356.7523
 
@@ -702,7 +718,7 @@ sun_direction = round(AZIMUTH % 360, 1) % 360  # 0-359.9 degrees clockwise from 
 name_prefix = f"{DATE.replace('-', '')}_{city.name.replace(' ', '')}_{EVENT}"
 name_suffix = f"{DATA_SOURCE.name}_{DATA_UPDATE_STR}"
 file_stem = f"{name_prefix}_{name_suffix}"
-title = f"{name_prefix}({sun_direction:.1f}°)_{name_suffix}"  # the file name stays without the direction
+title = f"{DATE.replace('-', '')}_{city.title_name.replace(' ', '')}_{EVENT}({sun_direction:.1f}°)_{name_suffix}"  # the file name stays without the direction
 ax.set_title(title, fontsize=14, fontweight='bold')
 if not strip_axes:
     ax.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)

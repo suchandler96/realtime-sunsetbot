@@ -31,9 +31,6 @@ max_output_chars = 20000         # stdout kept in the reply
 # false: main.py is started without --silent, so the figure also opens in a window on this machine
 # (the run then waits until the window is closed or run_timeout_seconds passes).  true: headless.
 silent = true
-# "subprocess": main.py in a separate Python (time limit, isolated crashes); "inprocess": runpy inside the
-# service process (see runner_inprocess.py; no time limit)
-runner = "subprocess"
 # Costly / interactive data sources.  The FY-4B satellite layer logs in to the NSMC portal.
 allow_satellite = false
 

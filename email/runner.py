@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs")
 PYTHON = sys.executable
+JOB_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+JOB_MAX_COUNT = 100
 
 
 @dataclass
@@ -22,6 +24,24 @@ class RunResult:
 def _pngs():
     return {f: os.path.getmtime(os.path.join(ROOT, f)) for f in os.listdir(ROOT)
             if f.endswith(".png") and not f.startswith("nsmc_captcha")}
+
+
+def cleanup_jobs(now=None):
+    """Remove job directories older than seven days, then keep only the newest 100 by name."""
+    if not os.path.isdir(JOBS_DIR):
+        return
+    now = time.time() if now is None else now
+    jobs = sorted(name for name in os.listdir(JOBS_DIR)
+                  if os.path.isdir(os.path.join(JOBS_DIR, name)))
+    current = []
+    for name in jobs:
+        path = os.path.join(JOBS_DIR, name)
+        if os.path.getmtime(path) < now - JOB_MAX_AGE_SECONDS:
+            shutil.rmtree(path)
+        else:
+            current.append(name)
+    for name in current[:-JOB_MAX_COUNT]:
+        shutil.rmtree(os.path.join(JOBS_DIR, name))
 
 
 def collect_figures(before, started):
@@ -40,6 +60,7 @@ def run_main(argv, timeout=900, max_chars=20000, headless=True):
 
     The figures it writes are moved into email/jobs/<timestamp>/ and returned.
     """
+    cleanup_jobs()
     before = _pngs()
     started = time.time()
     # UTF-8 both ways: with a pipe, Windows would otherwise encode main.py's output (Chinese text, degree signs) as cp1252
@@ -58,6 +79,7 @@ def run_main(argv, timeout=900, max_chars=20000, headless=True):
         output += f"\n--- stopped after the {timeout} s time limit ---"
         ok = False
     figures = collect_figures(before, started)
+    cleanup_jobs()
     if len(output) > max_chars:
         output = output[:max_chars] + f"\n... (output cut at {max_chars} characters)"
     return RunResult(ok and bool(figures), output, figures, time.time() - started)

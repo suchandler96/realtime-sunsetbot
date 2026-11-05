@@ -22,7 +22,8 @@ Try it without a mailbox:
     .venv_sunsetbot/bin/python email/service.py --eml request.eml                    # full run, reply -> request.reply.eml
 
 Files: `service.py` (loop, authorisation, rate limit), `request_parser.py` (text -> validated options -> argv),
-`runner.py` (runs main.py, collects figures into `email/jobs/`), `mailio.py` (IMAP/SMTP).
+`runner.py` (runs main.py and keeps figures in `email/jobs/` for up to 7 days, capped at 100 jobs),
+`mailio.py` (IMAP/SMTP).
 
 Safety model
 - Only `allowed_senders` get an answer (others are ignored silently); `require_dkim_pass` guards against forged From.

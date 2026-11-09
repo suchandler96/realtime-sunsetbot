@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from html import unescape as html_unescape
 from datetime import datetime, timedelta, timezone
 
@@ -43,6 +44,13 @@ DEFAULT_SESSION_FILE = os.path.join(HERE, ".nsmc_session.json")
 # Picked up automatically when it exists: username on line 1, password on line 2.
 DEFAULT_CREDENTIALS_FILE = os.path.join(HERE, "nsmc_credentials.txt")
 DOWNLOAD_STALL_S = 5  # a file download that receives no data for this long counts as failed
+PATIENT_STALL_S = 60  # patient mode: only a minute without a single byte counts as failed
+# The file server is slow on the first request for a file (cold cache) and fast on repeats, so a download that
+# cannot finish in time is given up early and the SAME file is retried before any other file is tried.
+SLOW_CHECK_AFTER_S = 10      # an attempt is judged once, after this long: its average speed must be at least ...
+SLOW_MIN_BYTES_PER_S = 1e5   # ... 100 KB/s (normal speed: 2-10 MB/s), otherwise it is abandoned
+DOWNLOAD_ATTEMPTS = 3        # attempts per file
+RETRY_PAUSE_S = (5, 15)      # waits before the 2nd and 3rd attempt
 DEFAULT_PRODUCTS = ["CTH", "CTT"]  # cloud top height, cloud top temperature
 SATELLITE, INSTRUMENT, AREA = "FY4B", "AGRI", "DISK"
 DOWNLOAD_SOURCE = "NewPortalCH"  # what the Chinese web page sends
@@ -100,6 +108,10 @@ class NotLoggedIn(PortalError):
 
 class TooFrequent(PortalError):
     pass
+
+
+class TooSlow(PortalError):
+    """The server delivers the file too slowly (or stalls); retrying the same file later often works."""
 
 
 class Portal:
@@ -256,8 +268,14 @@ class Portal:
         return self.s.post(BASE + "/v1/data/selection/file/download", stream=True, timeout=(15, 60), data={
             "downloadSource": DOWNLOAD_SOURCE, "fileName": name, "centerFlag": row.get("CNETERFLAG", "")})
 
-    def download(self, row, out_dir, deadline_s):
-        """Download one file; returns its path, or raises on any failure (partial file removed)."""
+    def download(self, row, out_dir, deadline_s, patient=False):
+        """Download one file; returns its path, or raises on any failure (partial file removed).
+
+        patient=True: no time limit and no minimum speed, however slow the download is; only
+        PATIENT_STALL_S seconds without receiving any byte end it."""
+        stall_s = PATIENT_STALL_S if patient else DOWNLOAD_STALL_S
+        if patient:
+            deadline_s = float("inf")
         name = row["ARCHIVENAME"]
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, name)
@@ -294,24 +312,66 @@ class Portal:
 
             threading.Thread(target=pump, daemon=True).start()
             try:
+                expected = int(float(row.get("DATASIZE") or 0))
+                got = 0
+                # a download that keeps up the minimum speed is not cut off by the time limit
+                deadline_s = max(deadline_s, expected / SLOW_MIN_BYTES_PER_S * 1.1 + 10)
+
+                def slow(why):
+                    elapsed = time.time() - started
+                    got_mb = f"{got / 1e6:.1f}" + (f"/{expected / 1e6:.1f}" if expected else "")
+                    return TooSlow(f"{why}: {got_mb} MB in {elapsed:.0f}s ({got / max(elapsed, 1e-3) / 1e3:.0f} KB/s)")
+
+                recent = deque([(started, 0)])   # (time, bytes) over the last ~2 s: the speed shown on screen
+                shown_at, checked = 0.0, False
+                interactive = sys.stdout.isatty()
+
+                def show_progress(now, final=False):
+                    nonlocal shown_at
+                    if now - shown_at < (0.25 if interactive else 10) and not final:
+                        return
+                    shown_at = now
+                    while len(recent) > 2 and now - recent[0][0] > 2:
+                        recent.popleft()
+                    span = max(now - recent[0][0], 1e-3)
+                    speed = (got - recent[0][1]) / span
+                    total = f"/{expected / 1e6:.1f}" if expected else ""
+                    pct = f" {got / expected:4.0%}" if expected else ""
+                    rate = f"{speed / 1e6:6.2f} MB/s" if speed >= 1e6 else f"{speed / 1e3:6.0f} KB/s"
+                    line = f"{name}  {got / 1e6:6.1f}{total} MB{pct}  {rate}"
+                    print(("\r" + line) if interactive else line, end="" if interactive else "\n", flush=True)
+
                 with open(part, "wb") as f:
                     while True:
-                        left = deadline_s - (time.time() - started)
+                        elapsed = time.time() - started
+                        left = deadline_s - elapsed
                         if left <= 0:
-                            raise PortalError(f"download exceeded {deadline_s}s")
+                            raise slow(f"download exceeded {deadline_s:.0f}s")
                         try:
-                            chunk = chunks.get(timeout=min(DOWNLOAD_STALL_S, left))
+                            chunk = chunks.get(timeout=min(stall_s, left))
                         except queue.Empty:
                             if time.time() - started >= deadline_s:
-                                raise PortalError(f"download exceeded {deadline_s}s")
-                            raise PortalError(f"no data received for {DOWNLOAD_STALL_S}s (download stalled)")
+                                raise slow(f"download exceeded {deadline_s:.0f}s")
+                            raise slow(f"no data received for {stall_s}s (download stalled)")
                         if chunk is None:
                             break
                         if isinstance(chunk, Exception):
                             raise chunk
                         f.write(chunk)
+                        got += len(chunk)
+                        now = time.time()
+                        recent.append((now, got))
+                        show_progress(now)
+                        # Judged ONCE, when the attempt is 10 s old: a download that started well is never cut
+                        # off for slowing down later (only a full stall or the size-based time limit ends it).
+                        if not patient and not checked and now - started >= SLOW_CHECK_AFTER_S:
+                            checked = True
+                            if got / (now - started) < SLOW_MIN_BYTES_PER_S:
+                                raise slow(f"too slow (< {SLOW_MIN_BYTES_PER_S / 1e3:.0f} KB/s)")
             finally:
                 stop.set()
+                if sys.stdout.isatty():
+                    print("\r" + " " * 79 + "\r", end="", flush=True)   # erase the progress line
             size, expected = os.path.getsize(part), int(float(row.get("DATASIZE") or 0))
             if expected and size != expected:
                 raise PortalError(f"size {size} != expected {expected}")
@@ -340,9 +400,9 @@ def file_start_time(name):
     return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc) if match else None
 
 
-def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, file_timeout=30,
+def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, file_timeout=70,
                  session_file=DEFAULT_SESSION_FILE, use_session_cache=True, search_only=False, portal=None,
-                 credentials_file=None, reference_time=None):
+                 credentials_file=None, reference_time=None, patient=False):
     """Download the newest ``count`` files of each product; returns ``({product: [paths]}, n_failed)``.
 
     With ``reference_time`` (UTC datetime) the files closest in time to it are taken instead of the newest.
@@ -367,7 +427,7 @@ def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, 
         else:
             print(f"\n{title}: {len(rows)} newest file(s) {begin:%Y-%m-%d} .. {end:%Y-%m-%d} UTC")
         for row in rows[:5]:
-            print(f"   {row['DATABEGINDATE']}  {int(float(row['DATASIZE'])) / 1e6:6.1f} MB  {row['ARCHIVENAME']}")
+            print(f"{row['ARCHIVENAME']}  {row['DATABEGINDATE']}  {int(float(row['DATASIZE'])) / 1e6:6.1f} MB")
         if not rows or search_only:
             continue
 
@@ -377,7 +437,7 @@ def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, 
                 break
             local = os.path.join(product_dir, row["ARCHIVENAME"])
             if os.path.exists(local) and os.path.getsize(local) == int(float(row.get("DATASIZE") or -1)):
-                print("already downloaded", local)
+                print(f"{row['ARCHIVENAME']}  already downloaded")
                 found[datatype].append(local)
                 continue
             if not portal.logged_in():
@@ -394,15 +454,32 @@ def fetch_newest(products, out_dir="fy4b_nsmc", count=1, days=1, candidates=10, 
                     portal.login(username, password)
                     if use_session_cache:
                         portal.save_session(session_file)
-            try:
-                path = portal.download(row, product_dir, file_timeout)
-            except TooFrequent as exc:
-                print("stop:", exc)
+            path, too_frequent = None, False
+            for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+                try:
+                    path = portal.download(row, product_dir, file_timeout, patient)
+                    break
+                except TooFrequent as exc:
+                    print("stop:", exc)
+                    too_frequent = True
+                    break
+                except (TooSlow, requests.RequestException) as exc:  # the same file usually works a moment later
+                    if attempt == DOWNLOAD_ATTEMPTS:
+                        print(f"{row['ARCHIVENAME']}  FAILED: {exc} (attempt {attempt}/{DOWNLOAD_ATTEMPTS}); "
+                              "trying the next file")
+                        break
+                    pause = RETRY_PAUSE_S[min(attempt - 1, len(RETRY_PAUSE_S) - 1)]
+                    print(f"{row['ARCHIVENAME']}  SLOW: {exc} (attempt {attempt}/{DOWNLOAD_ATTEMPTS}); "
+                          f"retrying the same file in {pause}s")
+                    time.sleep(pause)
+                except PortalError as exc:
+                    print(f"{row['ARCHIVENAME']}  FAILED: {exc}; trying the next file")
+                    break
+            if too_frequent:
                 break
-            except (PortalError, requests.RequestException) as exc:
-                print(f"failed {row['ARCHIVENAME']}: {exc}; trying the next newest file")
+            if path is None:
                 continue
-            print("saved", path)
+            print(f"{row['ARCHIVENAME']}  saved to {product_dir}")
             found[datatype].append(path)
         if len(found[datatype]) < count and not search_only:
             failures += 1
@@ -421,7 +498,10 @@ def main():
                     help="search window: from 00:00:00 UTC this many days ago to 23:59:59 UTC today "
                          "(the page's default is yesterday..today)")
     ap.add_argument("--out", default="fy4b_nsmc", help="download directory")
-    ap.add_argument("--file-timeout", type=int, default=30, help="give up on a file after this many seconds")
+    ap.add_argument("--file-timeout", type=int, default=70, help="give up on a file after this many seconds")
+    ap.add_argument("--patient", action="store_true",
+                    help="never give up on a slow download (no time limit, no minimum speed); only a minute "
+                         "without receiving any byte counts as failed, then the file is retried")
     ap.add_argument("--search-only", action="store_true", help="list the files, do not download")
     ap.add_argument("--session-file", default=DEFAULT_SESSION_FILE, help="cached login cookies")
     ap.add_argument("--no-session-cache", action="store_true", help="do not read or write the session file")
@@ -432,7 +512,7 @@ def main():
     _, failures = fetch_newest(
         args.product, args.out, args.count, args.days, args.candidates, args.file_timeout,
         args.session_file, not args.no_session_cache, args.search_only,
-        credentials_file=args.credentials_file)
+        credentials_file=args.credentials_file, patient=args.patient)
     sys.exit(1 if failures else 0)
 
 

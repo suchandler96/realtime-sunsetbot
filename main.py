@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
                         help="with --satellite-source fy4b, add a strip of the FY-4B cloud mask and cloud optical "
                              "thickness under the figure (downloads the newest CLM and CPD files) and break the "
                              "cloud-top line where there is no cloud")
+    parser.add_argument("--patient-download", action=argparse.BooleanOptionalAction, default=False,
+                        help="automatic FY-4B download: keep downloading the newest file however slow it is "
+                             "(only a minute without any data counts as failed) instead of moving on to another "
+                             "file when the download is too slow")
     parser.add_argument("--auto-cpd", action=argparse.BooleanOptionalAction, default=False,
                         help="with the automatic FY-4B download, also fetch the newest CPD file "
                              "(cloud optical thickness, daytime only) for the cloud-products transect figure")
@@ -101,9 +105,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Latin glyphs stay DejaVu Sans; Chinese characters (city names in titles) fall back to the first CJK font found
-plt.rcParams["font.family"] = ["DejaVu Sans", "Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "PingFang SC",
-                               "WenQuanYi Micro Hei", "Source Han Sans SC"]
+# Latin glyphs stay DejaVu Sans; Chinese characters (city names in titles) use the first installed CJK font.
+# Only installed fonts are listed: matplotlib logs a "findfont" warning for every missing family in the list.
+from matplotlib import font_manager
+_installed_fonts = {f.name for f in font_manager.fontManager.ttflist}
+CJK_FONT = next((name for name in ("Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "PingFang SC",
+                                   "WenQuanYi Micro Hei", "Source Han Sans SC", "Noto Sans SC", "Heiti SC",
+                                   "Noto Sans CJK JP", "Noto Sans CJK TC") if name in _installed_fonts), None)
+if CJK_FONT:
+    plt.rcParams["font.family"] = ["DejaVu Sans", CJK_FONT]
 
 # ==================== 1. 核心参数配置 ====================
 args = parse_args()
@@ -344,14 +354,15 @@ if INCLUDE_SATELLITE:
         try:
             portal = fy4nsmc.Portal()  # shared, so the login is done once
             if not SATELLITE_FILE:
-                downloaded.update(fy4nsmc.fetch_newest(["CTH"], portal=portal)[0])
+                downloaded.update(fy4nsmc.fetch_newest(["CTH"], portal=portal, patient=args.patient_download)[0])
                 SATELLITE_FILE = (downloaded.get("CTH") or [""])[0]
             # CLM / CPD: the files closest in time to the CTH file, so that the three products describe the same clouds
             companions = (["CLM"] if CLOUD_STRIP and not CLM_FILE else []) \
                          + (["CPD"] if (AUTO_CPD or CLOUD_STRIP) and not CPD_FILE else [])
             if companions and SATELLITE_FILE:
                 downloaded.update(fy4nsmc.fetch_newest(
-                    companions, portal=portal, reference_time=fy4nsmc.file_start_time(SATELLITE_FILE))[0])
+                    companions, portal=portal, reference_time=fy4nsmc.file_start_time(SATELLITE_FILE),
+                    patient=args.patient_download)[0])
         except Exception as exc:  # network / login problems must not kill the weather figure
             print(f"FY-4B download failed ({exc}); continuing without it")
         CLM_FILE = CLM_FILE or (downloaded.get("CLM") or [""])[0]
@@ -718,7 +729,7 @@ sun_direction = round(AZIMUTH % 360, 1) % 360  # 0-359.9 degrees clockwise from 
 name_prefix = f"{DATE.replace('-', '')}_{city.name.replace(' ', '')}_{EVENT}"
 name_suffix = f"{DATA_SOURCE.name}_{DATA_UPDATE_STR}"
 file_stem = f"{name_prefix}_{name_suffix}"
-title = f"{DATE.replace('-', '')}_{city.title_name.replace(' ', '')}_{EVENT}({sun_direction:.1f}°)_{name_suffix}"  # the file name stays without the direction
+title = f"{DATE.replace('-', '')}_{(city.title_name if CJK_FONT else city.name).replace(' ', '')}_{EVENT}({sun_direction:.1f}°)_{name_suffix}"  # the file name stays without the direction
 ax.set_title(title, fontsize=14, fontweight='bold')
 if not strip_axes:
     ax.set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)

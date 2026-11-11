@@ -27,6 +27,9 @@ import raytrace
 import terrain
 import fy4nsmc
 import radar
+import sunset_core as core
+from sunset_core import (PRESSURE_LEVELS, HA_KM, X_MIN, X_MAX, STEP_KM, TERRAIN_STEP_KM,
+                         INTERMEDIATE_RAY_STEP_MIN)
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,15 +144,7 @@ else:
     except CityLookupError as exc:
         sys.exit(f"Error: {exc}")
     print(f"Observer: {city.name} ({city.latitude:.4f}, {city.longitude:.4f}), time zone {city.timezone}")
-R_EARTH_EQUATOR = 6378.1370
-R_EARTH_POLAR = 6356.7523
-
-a_cos_phi_sq = (R_EARTH_EQUATOR * np.cos(np.radians(city.latitude))) ** 2
-b_sin_phi_sq = (R_EARTH_POLAR * np.sin(np.radians(city.latitude))) ** 2
-R_EARTH = np.sqrt((R_EARTH_EQUATOR**2 * a_cos_phi_sq + R_EARTH_POLAR**2 * b_sin_phi_sq) /
-                  (a_cos_phi_sq + b_sin_phi_sq))
 INCLUDE_TERRAIN = True    # 绘制地形 (AWS terrarium DEM)，并把观测者放在本地海拔
-HA_KM = 1.0               # 气溶胶最低透光高度 (km)，可调整
 
 # 云底高度模式：True 为自动识别，False 为手动指定 MANUAL_CBH_KM
 AUTO_CLOUD_BASE = args.cloud_base < 0
@@ -188,59 +183,26 @@ AEROSOL_LEVELS_KM = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]  # iso-line values of
 SILENT_MODE = args.silent
 SAVE_FIGURE = args.save
 
-# 模型数据更新时间估算 (UTC 起报时刻)。
-# Open-Meteo 标准 forecast 接口不直接返回起报时刻，这里按当前时间与模型循环周期估算。
-MODEL_CYCLE_HOURS = {DataSource.GFS: 6, DataSource.GFS_AWS: 6, DataSource.ECMWF: 12, DataSource.JMA_MSM: 3,
-                     DataSource.CMA_GFS: 6, DataSource.HRRR: 1}
-MODEL_RUN_DELAY_HOURS = {DataSource.GFS: 5, DataSource.GFS_AWS: 4, DataSource.ECMWF: 9, DataSource.JMA_MSM: 2,
-                         DataSource.CMA_GFS: 6, DataSource.HRRR: 2}
+# 模型数据更新时间 (UTC 起报时刻)：先取发布/估算值，取到真实数据后以其实际起报时刻为准
+DATA_UPDATE_STR = core.model_run_label(DATA_SOURCE)
 
-
-def latest_model_run(source):
-    """估算当前可用的最新模型起报时刻 (UTC)。"""
-    available = datetime.now(timezone.utc) - timedelta(hours=MODEL_RUN_DELAY_HOURS[source])
-    cycle = MODEL_CYCLE_HOURS[source]
-    run_hour = available.hour - (available.hour % cycle)
-    return available.replace(hour=run_hour, minute=0, second=0, microsecond=0)
-
-
-# Open-Meteo publishes the real run time per dataset (gfs_seamless is a blend; use the global GFS).
-META_DATASET = {DataSource.GFS: "ncep_gfs013", DataSource.GFS_AWS: "ncep_gfs013"}
-
-
-def published_model_run(source):
-    """Latest run initialization time (UTC) reported by Open-Meteo, or None if unavailable."""
-    import requests
-    dataset = META_DATASET.get(source, source.value)
-    try:
-        r = requests.get(f"https://api.open-meteo.com/data/{dataset}/static/meta.json", timeout=5)
-        r.raise_for_status()
-        return datetime.fromtimestamp(r.json()["last_run_initialisation_time"], timezone.utc)
-    except Exception:
-        return None
-
-
-_run = published_model_run(DATA_SOURCE) or latest_model_run(DATA_SOURCE)
-DATA_UPDATE_STR = _run.strftime("%Y%m%d%H") + "z"
-
-# 计算日出/日落时间、太阳方位角与仰角
-sun = sun_event(city.latitude, city.longitude, DATE, EVENT, TIMEZONE)
-AZIMUTH = sun.position.azimuth
-SUN_ELEVATION = sun.position.geometric_elevation  # 负值表示太阳在地平线以下
-
-# 空间跨度配置：从 -100km 到 900km
-X_MIN, X_MAX = -100, 900
-STEP_KM = 20
+# 计算日出/日落时间、太阳方位角与仰角，以及沿太阳方向的采样点 (-100 km 到 900 km)
+transect = core.make_transect(city, DATE, EVENT)
+sun = transect.sun
+AZIMUTH = transect.azimuth
+SUN_ELEVATION = transect.sun_elevation  # 负值表示太阳在地平线以下
 RADAR_STEP_KM = 1  # radar pixels are ~1.4-2.4 km, so sample the radar much finer than the model grid
 FY4B_STEP_KM = 4   # FY-4B L2 pixels are 4 km, so sample the satellite at its native resolution
 
-distances = np.arange(X_MIN, X_MAX + STEP_KM, STEP_KM)
+distances = transect.distances
 radar_distances = np.arange(X_MIN, X_MAX + RADAR_STEP_KM, RADAR_STEP_KM)
+lats, lons = transect.lats, transect.lons
 
-# 垂直气压层与对应的大致海拔高度 (米)
-PRESSURE_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200, 150, 100]
-# Approximate heights; only a fallback when the model gives no geopotential height.
-ALTITUDES_KM = [0.1, 0.2, 0.4, 0.6, 0.8, 1.5, 2.0, 3.0, 4.2, 5.6, 7.2, 9.2, 10.4, 11.8, 13.6, 16.2]
+# 卫星采样点：FY-4B 用其原生分辨率，其余数据源保持模式网格间距 (Himawari 的采样逐点扫描整幅图，较慢)
+satellite_step_km = FY4B_STEP_KM if SATELLITE_SOURCE == "fy4b" else STEP_KM
+satellite_distances = np.arange(X_MIN, X_MAX + satellite_step_km, satellite_step_km)
+satellite_lats, satellite_lons = core.points_along(transect, satellite_distances)
+radar_lats, radar_lons = core.points_along(transect, radar_distances)
 
 # Cloud phase (only with data carrying cloud liquid/ice water): ice share of the cloud-water mass
 CLOUD_WATER_MIN = 1e-8                 # kg/kg; below this the cell is treated as having no cloud water
@@ -256,147 +218,36 @@ RH_COLORS = [
     "#8BC1DD", "#6DA3D2",
 ]
 
-# ==================== 2. 采样点地理坐标计算 ====================
-def get_point_at_distance(lat, lon, dist_km, azimuth):
-    R = R_EARTH
-    bearing = math.radians(azimuth)
-    d_r = dist_km / R
-    lat1, lon1 = math.radians(lat), math.radians(lon)
-
-    lat2 = math.asin(math.sin(lat1) * math.cos(d_r) + math.cos(lat1) * math.sin(d_r) * math.cos(bearing))
-    lon2 = lon1 + math.atan2(math.sin(bearing) * math.sin(d_r) * math.cos(lat1), math.cos(d_r) - math.sin(lat1) * math.sin(lat2))
-    return math.degrees(lat2), math.degrees(lon2)
-
-lats, lons = [], []
-for d in distances:
-    pt_lat, pt_lon = get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH)
-    lats.append(pt_lat)
-    lons.append(pt_lon)
-
-# 卫星采样点：FY-4B 用其原生分辨率，其余数据源保持模式网格间距 (Himawari 的采样逐点扫描整幅图，较慢)
-satellite_step_km = FY4B_STEP_KM if SATELLITE_SOURCE == "fy4b" else STEP_KM
-satellite_distances = np.arange(X_MIN, X_MAX + satellite_step_km, satellite_step_km)
-satellite_lats, satellite_lons = zip(*(
-    get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH) for d in satellite_distances))
-radar_lats, radar_lons = zip(*(
-    get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH) for d in radar_distances))
-
 # ==================== 3. 请求气象数据 (相对湿度与云量) ====================
 print(
     f"正在获取 {DATE} {EVENT} 的相对湿度与云量剖面 "
     f"({DATA_SOURCE.value}, az={AZIMUTH:.1f}°, elev={SUN_ELEVATION:.2f}°) ..."
 )
-def request_profile(backend=None, cloud_water=False):
-    request = (
-        WeatherData.source(DATA_SOURCE, backend=backend)
-        .coordinates(lats, lons)
-        .pressure_levels(PRESSURE_LEVELS)
-        .relative_humidity()
-        .cloud_cover()
-        .temperature()
-        .geopotential_height()
-        .timezone(TIMEZONE)
-        .on(DATE)
-        .valid_at(sun.time)
-    )
-    return (request.cloud_water() if cloud_water else request).fetch()
-
-
-weather = None
-if DATA_SOURCE is DataSource.GFS_AWS:
-    try:
-        weather = request_profile(gfs_aws.GfsAwsBackend(), cloud_water=True)
-    except Exception as exc:  # network / bucket problems must not kill the figure: use Open-Meteo's GFS instead
-        print(f"GFS download from AWS failed ({exc}); using Open-Meteo GFS instead (no cloud phase)")
-        DATA_SOURCE = DataSource.GFS
-if weather is None:
-    weather = request_profile()
+# 计算部分见 sunset_core.py (同样可一次批量取多个剖面)；这里只取一个剖面
+(weather,), DATA_SOURCE = core.fetch_weather_batch([transect], DATA_SOURCE)
 HAS_CLOUD_PHASE = "cloud_ice_water" in weather.variables   # only the native-model (AWS GFS) data carries it
 if weather.model_run is not None:   # the run really used, not an estimate
-    DATA_UPDATE_STR = weather.model_run.strftime("%Y%m%d%H") + "z"
-    print(f"GFS from AWS: run {weather.model_run:%Y-%m-%d %Hz} (plain global GFS, with cloud liquid/ice water)")
+    DATA_UPDATE_STR = core.model_run_label(DATA_SOURCE, weather)
 
 print(f"Computed {EVENT} time: {sun.time:%Y-%m-%d %H:%M:%S %Z}")
 
-# Some models lack some pressure levels (e.g. ECMWF: 975/950/900/800 hPa); fill them by interpolation.
-filled_levels = weather.fill_missing_levels()
-if filled_levels:
-    print(f"Interpolated pressure levels missing in {DATA_SOURCE.value}: "
-          + ", ".join(f"{p} hPa" for p in filled_levels))
-
-# 选择距离日出/日落时刻最近的小时
-time_idx = weather.nearest_index(sun.time)
-
-# 每个剖面点、每个气压层的真实位势高度 (km)；缺失时退回到 ALTITUDES_KM 近似表
-height_km = weather.values("geopotential_height")[:, :, time_idx] / 1000.0
-height_km = np.where(np.isnan(height_km), np.asarray(ALTITUDES_KM)[:, None], height_km)
-
-# 3.0 地形：沿剖面 (1 km 间隔) 的 DEM 海拔 (km)；观测者位于 x=0 处的本地海拔
-TERRAIN_STEP_KM = 3
-terrain_distances = np.arange(X_MIN, X_MAX + TERRAIN_STEP_KM, TERRAIN_STEP_KM)
-terrain_lats, terrain_lons = zip(*(
-    get_point_at_distance(city.latitude, city.longitude, d, AZIMUTH) for d in terrain_distances))
-terrain_km = None
-observer_km = 0.0
-if INCLUDE_TERRAIN:
-    try:
-        terrain_km = terrain.read_elevation(terrain_lats, terrain_lons)
-    except Exception as exc:  # network problems must not kill the weather figure
-        print(f"Terrain download failed ({exc}); continuing without terrain")
-    if terrain_km is not None:
-        observer_km = float(np.interp(0.0, terrain_distances, terrain_km))
-        print(f"Terrain: observer at {observer_km * 1000:.0f} m; profile {terrain_km.min() * 1000:.0f}"
-              f"-{terrain_km.max() * 1000:.0f} m")
-# 模式自身的 (平滑) 地形高度 (km)；低于它的气压层数据是外推值。
-# 图中不用 NaN 去掩盖 (会在地形附近留下白色区域)，而是让地面填充一直盖到 DEM 与模式地形中较高者；
-# 识别本地云底时则直接排除这些层。
-model_terrain_km = np.nan_to_num(weather.model_elevation_km, nan=0.0)
-underground = height_km < model_terrain_km[None, :]
-ground_top_km = None
-if terrain_km is not None:
-    ground_top_km = np.maximum(terrain_km, np.interp(terrain_distances, distances, model_terrain_km))
-    print(f"Model terrain: {model_terrain_km.min() * 1000:.0f}-{model_terrain_km.max() * 1000:.0f} m "
-          f"(observer cell {model_terrain_km[distances == 0][0] * 1000:.0f} m)")
-
-# 3.1 本地(x=0)云底高度
-if AUTO_CLOUD_BASE:
-    # 自动识别：取首个相对湿度饱和或云量明显的层结
-    obs_idx = np.where(distances == 0)[0][0]
-    rh_at_observer = np.where(underground[:, obs_idx], np.nan, weather.values("relative_humidity")[:, obs_idx, time_idx])
-    cloud_at_observer = np.where(underground[:, obs_idx], np.nan, weather.values("cloud_cover")[:, obs_idx, time_idx])
-
-    cloud_layer_mask = (rh_at_observer >= 99) | (cloud_at_observer >= 50)
-    if np.any(cloud_layer_mask):
-        k = int(np.argmax(cloud_layer_mask))
-        local_cbh_km = float(height_km[k, obs_idx])
-        # 云底位于首个有云层与其下方晴空层之间：按阈值穿越位置线性插值 (与图中云区边界一致)
-        if k > 0 and not np.isnan(rh_at_observer[k - 1]):
-            crossings = []
-            for below, here, threshold in ((rh_at_observer[k - 1], rh_at_observer[k], 99.0),
-                                           (cloud_at_observer[k - 1], cloud_at_observer[k], 50.0)):
-                if here >= threshold > below:
-                    crossings.append(height_km[k - 1, obs_idx]
-                                     + (threshold - below) / (here - below) * (height_km[k, obs_idx] - height_km[k - 1, obs_idx]))
-            if crossings:
-                local_cbh_km = float(min(crossings))
-                print(f"Local cloud base: {local_cbh_km:.2f} km (interpolated; first cloudy level at "
-                      f"{height_km[k, obs_idx]:.2f} km)")
-    else:
-        local_cbh_km = None  # 晴空无云：不设默认云底，不绘制光线也不做积分
-else:
-    local_cbh_km = MANUAL_CBH_KM
-
-# 3.2 相对湿度、云量与温度矩阵 [高度层, 距离点]，取距离日出/日落最近时次
-rh_matrix = weather.values("relative_humidity")[:, :, time_idx]
-cloud_matrix = weather.values("cloud_cover")[:, :, time_idx]
-temp_matrix = weather.values("temperature")[:, :, time_idx]
-cloud_liquid_matrix = cloud_ice_matrix = ice_fraction = None
-if HAS_CLOUD_PHASE:
-    cloud_liquid_matrix = weather.values("cloud_liquid_water")[:, :, time_idx]
-    cloud_ice_matrix = weather.values("cloud_ice_water")[:, :, time_idx]
-    condensate = np.nan_to_num(cloud_liquid_matrix) + np.nan_to_num(cloud_ice_matrix)
-    # ice share of the cloud water mass; NaN where the model holds no cloud water
-    ice_fraction = np.where(condensate > CLOUD_WATER_MIN, np.nan_to_num(cloud_ice_matrix) / np.maximum(condensate, 1e-30), np.nan)
+# 剖面数组：真实高度、地形、云底、RH/云量/温度 (见 core.Profile)
+profile = core.build_profile(transect, weather, cloud_base_km=args.cloud_base, include_terrain=INCLUDE_TERRAIN)
+time_idx = profile.time_idx
+height_km = profile.height_km
+terrain_distances = profile.terrain_distances
+terrain_km = profile.terrain_km
+observer_km = profile.observer_km
+model_terrain_km = profile.model_terrain_km
+underground = profile.underground
+ground_top_km = profile.ground_top_km
+local_cbh_km = profile.local_cbh_km
+rh_matrix = profile.rh
+cloud_matrix = profile.cloud
+temp_matrix = profile.temp
+cloud_liquid_matrix = profile.cloud_liquid
+cloud_ice_matrix = profile.cloud_ice
+ice_fraction = profile.ice_fraction
 
 # 3.3 卫星云顶信息：通过 SATELLITE_SOURCE 选择数据源，并沿剖面采样 (可选)
 cloud_top_temp_c = None
@@ -603,153 +454,21 @@ if cloud_state is not None:
 if strip_axes:
     strip_axes[-1].set_xlabel("Distance from Observer (km) [Towards Sun direction]", fontsize=12)
 
-# 4.2 计算并绘制两条边界光路 (光线追踪)
+# 4.2 计算并绘制两条边界光路 (光线追踪，计算见 core.trace_rays)
 # 展平坐标系：x 为沿地表朝向太阳的距离 (km)，y 为海拔高度 (km)。
 # 两条光线都经过观测者头顶的云底 (x=0, y=h)，分别代表最早和最晚还能照到云底的光线。
 sun_side_x = distances[distances >= 0]  # 只绘制朝向太阳的一侧 (x >= 0)
 
-
-def earliest_light_y(x, h):
-    """最早能照到云底的光线：经过 (0, h)，平行于与地表 (半径 R)于(0,0)相切的光线。"""
-    s = x / R_EARTH
-    return h + 0.5 * (R_EARTH + h) * s**2 * (1.0 + 5.0 * s**2 / 12.0)
-
-
-def latest_light_y(x, h, ha=None):
-    """最晚还能照到云底的光线：与气溶胶层顶 (半径 R+ha) 相切，并经过 (0, h)。
-
-    ha 为光线最低点的高度，缺省为气溶胶层顶；中间光线传入介于 0 与层顶之间的值。"""
-    if ha is None:
-        ha = min(HA_KM, h)  # 若云底低于气溶胶层顶，则最晚光线退化为与地表相切
-    theta = math.acos((R_EARTH + ha) / (R_EARTH + h))
-    s = theta - x / R_EARTH
-    return ha + (R_EARTH + ha) * 0.5 * s**2 * (1.0 + 5.0 * s**2 / 12.0)
-
-
+rays = core.trace_rays(profile, aerosol_profile, aerosol_height_km, AEROSOL_WAVELENGTH,
+                       transmittance=args.transmittance, ray_min_transmittance=RAY_MIN_TRANSMITTANCE)
 extinction_model = None
-if local_cbh_km is None:
-    print("No cloud base detected and none given (--cloud-base); no light rays are traced.")
-else:
-    # 两条光线对应的时刻：贴地光线 = 本地日出/日落时刻；掠过气溶胶层顶的光线与之相差 last_light_delay
-    # (日落后延迟 / 日出前提前)。日落时贴地光线最早，日出时则最晚。
-    ground_ray_time = sun.time
-    aerosol_ray_delay = last_light_delay(city.latitude, sun.position.declination, R_EARTH,
-                                         local_cbh_km, min(HA_KM, local_cbh_km))
-    aerosol_ray_limit = "aerosol top"
-
-
-    def terrain_limited_delay(delay):
-        """地形遮挡修正：气溶胶光线若落到 地形 + 气溶胶层顶 之下，则每次提前 0.5 分钟迭代，直到不再被遮挡。
-
-        只在上一条光线被遮挡的 x 位置上检验新光线 (光线族逐条抬高，被遮挡的 x 只会越来越少)；
-        返回 (新的延迟, 初始光线被遮挡的 x 范围 (km) 或 None, 是否在延迟 0 (最早光线) 处仍被遮挡)。"""
-        x_check = terrain_distances[terrain_distances >= 0]
-        # 气溶胶层顶不会高于观测者头顶的云底
-        ha_above_ground = min(HA_KM, max(local_cbh_km - observer_km, 0.0))
-        required = np.interp(x_check, terrain_distances, terrain_km) + ha_above_ground
-        blocked = np.where(latest_light_y(x_check, local_cbh_km) < required - 1e-9)[0]
-        if blocked.size == 0:
-            return delay, None, False
-        blocked_range = (float(x_check[blocked[0]]), float(x_check[blocked[-1]]))
-        step_back = timedelta(minutes=0.5)
-        while blocked.size and delay > timedelta(0):
-            delay = max(delay - step_back, timedelta(0))
-            y = latest_light_y(x_check[blocked], local_cbh_km, grazing_height(
-                city.latitude, sun.position.declination, R_EARTH, local_cbh_km, delay))
-            blocked = blocked[y < required[blocked] - 1e-9]
-        return delay, blocked_range, bool(blocked.size)
-
-
-    if terrain_km is not None:
-        unblocked_delay = aerosol_ray_delay
-        aerosol_ray_delay, blocked_range, still_blocked = terrain_limited_delay(aerosol_ray_delay)
-        if blocked_range is not None:
-            aerosol_ray_limit = "terrain"
-            print(f"Aerosol-top-grazing ray ({unblocked_delay.total_seconds() / 60:.1f} min) is blocked by terrain at "
-                  f"x = {blocked_range[0]:.0f}-{blocked_range[1]:.0f} km; stepping back 0.5 min at a time -> "
-                  f"{aerosol_ray_delay.total_seconds() / 60:.1f} min")
-            if still_blocked:
-                print("Warning: even the earliest ray (at the ground-grazing time) is blocked by terrain.")
-    aerosol_ray_time = ground_ray_time + (aerosol_ray_delay if EVENT == "sunset" else -aerosol_ray_delay)
-    ground_ray_name, aerosol_ray_name = (("Earliest", "Latest") if EVENT == "sunset" else ("Latest", "Earliest"))
-    print(f"{ground_ray_name} light to cloud base (ground-grazing ray): {ground_ray_time:%H:%M:%S %Z}; "
-          f"{aerosol_ray_name.lower()} ({aerosol_ray_limit}-grazing ray): {aerosol_ray_time:%H:%M:%S %Z} "
-          f"({aerosol_ray_delay.total_seconds() / 60:.1f} min {'after sunset' if EVENT == 'sunset' else 'before sunrise'})")
-
-    # 4.2b 沿光线积分气溶胶、瑞利和冰云消光；目标以外的含水/混合相云直接遮断直射光
-    if args.transmittance:
-        extinction_model = raytrace.ProfileExtinction(
-            distances, height_km, cloud_matrix, temp_matrix, underground=underground,
-            aerosol_extinction=None if aerosol_profile is None else aerosol_profile.extinction_per_km,
-            aerosol_heights_km=aerosol_height_km, wavelength_nm=AEROSOL_WAVELENGTH,
-            **(dict(zip(("liquid_extinction", "ice_extinction"), raytrace.condensate_extinction(
-                np.asarray(PRESSURE_LEVELS, dtype=float)[:, None], temp_matrix, cloud_liquid_matrix,
-                cloud_ice_matrix, cloud_matrix))) if HAS_CLOUD_PHASE else {}))
-        if aerosol_profile is None:
-            print("Transmittance: no aerosol data (use --aerosol); only cloud and Rayleigh extinction are integrated.")
-    ray_x_fine = np.arange(0.0, X_MAX + 0.5, 1.0)
-    RAY_SCAN_STEP = timedelta(minutes=0.5)        # 扫描光线的时间间隔 (与地形迭代相同)
-    INTERMEDIATE_RAY_STEP_MIN = 5   # 中间光线的时间间隔 (从日出/日落时刻起算)
-    INTERMEDIATE_RAY_GAP_MIN = 2    # 最后一条中间光线与气溶胶光线至少相隔的分钟数
-    direction = 1 if EVENT == "sunset" else -1
-
-
-    def ray_y_at(x, delay):
-        """日落后延迟 `delay` (日出前提前) 到达本地云底的光线高度。"""
-        if delay <= timedelta(0):
-            return earliest_light_y(x, local_cbh_km)
-        if delay >= aerosol_ray_delay:
-            return latest_light_y(x, local_cbh_km, None if aerosol_ray_limit == "aerosol top" else grazing_height(
-                city.latitude, sun.position.declination, R_EARTH, local_cbh_km, aerosol_ray_delay))
-        return latest_light_y(x, local_cbh_km, grazing_height(
-            city.latitude, sun.position.declination, R_EARTH, local_cbh_km, delay))
-
-
-    def percent(t):
-        return f"{t:.0%}" if t >= 0.1 else f"{t:.1%}"
-
-
-    def T_text(result):
-        """Describe cloud blockage explicitly and otherwise apply the direct-beam display threshold."""
-        if result is None:
-            return ""
-        if result.blocked_by_cloud:
-            return " blocked"
-        return f" <{percent(RAY_MIN_TRANSMITTANCE)}" if result.stopped_at_km is not None else f" {percent(result.transmittance)}"
-
-
-    # 每 0.5 分钟一条光线；目标以外的含水/混合相云遮断，冰云按有限光学厚度处理
-    scan_delays = [RAY_SCAN_STEP * k for k in range(int(aerosol_ray_delay / RAY_SCAN_STEP) + 1)]
-    if not scan_delays or scan_delays[-1] < aerosol_ray_delay:
-        scan_delays.append(aerosol_ray_delay)
-    scan_results = [None] * len(scan_delays)
-    if extinction_model is not None:
-        print(f"Direct transmittance of {len(scan_delays)} light rays "
-              f"(water-cloud blocking + Beer-Lambert ice cloud/CAMS aerosol/Rayleigh); "
-              f"{percent(RAY_MIN_TRANSMITTANCE)} is a direct-beam reporting threshold, not a sunset-glow boundary:")
-        scan_results = [extinction_model.integrate(
-            ray_x_fine, ray_y_at(ray_x_fine, d),
-            tau_stop=-math.log(max(RAY_MIN_TRANSMITTANCE, 1e-6))) for d in scan_delays]
-    shown = [r is None or r.transmittance >= RAY_MIN_TRANSMITTANCE for r in scan_results]
-    for k, (d, r) in enumerate(zip(scan_delays, scan_results)):
-        if r is not None and (k % 10 == 0 or k == len(scan_delays) - 1 or shown[k] != shown[k - 1]):
-            stop = (f", cloud blocked at x={r.stopped_at_km:.0f} km" if r.blocked_by_cloud else
-                    f", first below threshold at x={r.stopped_at_km:.0f} km" if r.stopped_at_km is not None else "")
-            transmission = ("blocked" if r.blocked_by_cloud else
-                            T_text(r).replace(" <", "< ") if r.stopped_at_km is not None else
-                            "= " + percent(r.transmittance))
-            print(f"  {ground_ray_time + direction * d:%H:%M:%S}: T {transmission} R/G/B {'/'.join(percent(t) for t in r.rgb_transmittance)} (tau cloud {r.tau_cloud:.2f}, "
-                  f"aerosol {r.tau_aerosol:.2f}, Rayleigh {r.tau_rayleigh:.2f}){stop}"
-                  f"{'' if shown[k] else '  [below direct-beam threshold]'}")
-
-    # 5 分钟整数倍的中间光线：始终显示；直射透过率不是火烧云是否可见的硬边界
-    step = timedelta(minutes=INTERMEDIATE_RAY_STEP_MIN)
-    intermediate_rays = []  # (time, ray height, transmittance)
-    delay = step
-    while delay <= aerosol_ray_delay - timedelta(minutes=INTERMEDIATE_RAY_GAP_MIN):
-        k = min(range(len(scan_delays)), key=lambda i: abs(scan_delays[i] - delay))
-        intermediate_rays.append((ground_ray_time + direction * delay, ray_y_at(sun_side_x, delay), scan_results[k]))
-        delay += step
+if rays is not None:
+    extinction_model = rays.extinction_model
+    ground_ray_time, ground_ray_name = rays.ground_ray_time, rays.ground_ray_name
+    aerosol_ray_time, aerosol_ray_name = rays.aerosol_ray_time, rays.aerosol_ray_name
+    scan_delays, scan_results = rays.scan_delays, rays.scan_results
+    intermediate_rays = rays.intermediate_rays
+    ray_y_at, T_text = rays.ray_y_at, rays.t_text
 
 
     def label_ray_time(x, y, when, color, side, result=None, top_km=15.3, **text):

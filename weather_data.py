@@ -21,6 +21,8 @@ ever required, a new backend can be added without changing the fluent call-sites
 
 from __future__ import annotations
 
+import copy
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from enum import Enum
@@ -94,15 +96,30 @@ class OpenMeteoBackend(WeatherBackend):
                 )
 
         if all(inside):
-            return self._as_points(self._query(request, latitudes, longitudes))
+            return self._query_points(request, latitudes, longitudes)
 
-        # Query the in-domain points in a single request, then scatter the
+        # Query the in-domain points together, then scatter the
         # responses back so out-of-domain points stay aligned as missing (None)
         # and are simply skipped when plotting.
         keep_lats = [lat for lat, ok in zip(latitudes, inside) if ok]
         keep_lons = [lon for lon, ok in zip(longitudes, inside) if ok]
-        payloads = iter(self._as_points(self._query(request, keep_lats, keep_lons)))
+        payloads = iter(self._query_points(request, keep_lats, keep_lons))
         return [next(payloads) if ok else None for ok in inside]
+
+    # One GET carries every coordinate and every variable-level name in its URL (~16 characters per point plus
+    # ~2.5 kB of variable names), so a batch of many profiles (a map) is sent as several requests of this size.
+    MAX_POINTS_PER_REQUEST = 150
+    RATE_LIMIT_RETRIES = 3
+    RATE_LIMIT_WAIT_S = 61
+
+    def _query_points(self, request: "WeatherRequest", latitudes, longitudes) -> list[dict]:
+        """One payload per point, in order; a single point or a few profiles go out as one request."""
+        step = self.MAX_POINTS_PER_REQUEST
+        payloads: list[dict] = []
+        for start in range(0, len(latitudes), step):
+            payloads.extend(self._as_points(
+                self._query(request, latitudes[start:start + step], longitudes[start:start + step])))
+        return payloads
 
     def _query(self, request: "WeatherRequest", latitudes, longitudes) -> "list[dict] | dict":
         if any(v in ("cloud_liquid_water", "cloud_ice_water") for v in request._variables):
@@ -122,12 +139,22 @@ class OpenMeteoBackend(WeatherBackend):
         else:
             params["forecast_days"] = request._forecast_days
 
-        response = requests.get(self._ENDPOINT, params=params, timeout=30)
-        try:
-            payload = response.json()
-        except ValueError:
-            response.raise_for_status()
-            raise
+        for attempt in range(self.RATE_LIMIT_RETRIES + 1):
+            response = requests.get(self._ENDPOINT, params=params, timeout=30)
+            try:
+                payload = response.json()
+            except ValueError:
+                response.raise_for_status()
+                raise
+            # The minutely quota is weighted by points x variables, so one profile already takes a large share
+            # and a batch of profiles can hit it: wait for the next minute instead of failing.
+            reason = str(payload.get("reason", "")) if isinstance(payload, dict) else ""
+            if "Minutely API request limit" in reason and attempt < self.RATE_LIMIT_RETRIES:
+                print(f"Open-Meteo minutely limit reached; retrying in {self.RATE_LIMIT_WAIT_S} s "
+                      f"({attempt + 1}/{self.RATE_LIMIT_RETRIES}) ...")
+                time.sleep(self.RATE_LIMIT_WAIT_S)
+                continue
+            break
         # Open-Meteo reports domain/parameter problems as a JSON body (usually
         # with an HTTP 400 status), so surface those before raising on status.
         if isinstance(payload, dict) and "error" in payload:
@@ -330,6 +357,19 @@ class WeatherResult:
                 level_arrays.append(np.asarray(point_series, dtype=float))
             # Shape: (n_levels, n_points, n_times)
             self._arrays[variable] = np.stack(level_arrays)
+
+    def subset(self, points) -> "WeatherResult":
+        """The result restricted to some of its points (a slice or a list of point indices), as a new result.
+
+        A batch fetch covers many profiles in one request; `subset` hands each profile its own columns, so the
+        code working on one profile does not care whether the data came from a batch or from a lone request."""
+        selected = np.arange(len(self.latitudes))[points]
+        part = copy.copy(self)
+        part.latitudes = [self.latitudes[i] for i in selected]
+        part.longitudes = [self.longitudes[i] for i in selected]
+        part.model_elevation_km = self.model_elevation_km[selected]
+        part._arrays = {name: array[:, selected, :] for name, array in self._arrays.items()}
+        return part
 
     def values(self, variable: str) -> np.ndarray:
         """Return a (n_levels, n_points, n_times) array for one base variable."""

@@ -98,6 +98,9 @@ def parse_args() -> argparse.Namespace:
                              "direct transmittance next to the ray time")
     parser.add_argument("--ray-min-transmittance", type=float, default=0.001,
                         help="threshold for reporting direct transmission; cloud checks continue over the full ray")
+    parser.add_argument("--cloud-map", action=argparse.BooleanOptionalAction, default=False,
+                        help="also draw Himawari visible + infrared satellite maps (NASA GIBS) around the "
+                             "light path, with the path drawn on them")
     parser.add_argument("--save", action=argparse.BooleanOptionalAction, default=False,
                         help="save the figure to a PNG file")
     parser.add_argument("--silent", action=argparse.BooleanOptionalAction, default=False,
@@ -818,6 +821,17 @@ if SATELLITE_SOURCE == "fy4b" and SATELLITE_FILE and CPD_FILE:
             print(f"Cloud-products figure saved to {companion_path}")
     else:
         print("Cloud-products transect skipped: satellite file(s) not found.")
+
+# ==================== 7. Himawari 可见光/红外云图 (NASA GIBS) ====================
+if args.cloud_map:
+    import cloudmap
+    try:
+        cloudmap.draw_cloud_map(
+            city.latitude, city.longitude, AZIMUTH, sun.time_utc,
+            title=f"{city.name} {DATE} {EVENT}", x_min=0, x_max=X_MAX,
+            save_path=f"{file_stem}_cloudmap.png" if SAVE_FIGURE else None)
+    except Exception as exc:  # network / server problems must not kill the main figure
+        print(f"Cloud map skipped: {exc}")
 
 if not SILENT_MODE:
     plt.show()

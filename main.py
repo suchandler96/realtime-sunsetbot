@@ -196,7 +196,24 @@ def latest_model_run(source):
     return available.replace(hour=run_hour, minute=0, second=0, microsecond=0)
 
 
-DATA_UPDATE_STR = latest_model_run(DATA_SOURCE).strftime("%Y%m%d%H") + "z"
+# Open-Meteo publishes the real run time per dataset (gfs_seamless is a blend; use the global GFS).
+META_DATASET = {DataSource.GFS: "ncep_gfs013"}
+
+
+def published_model_run(source):
+    """Latest run initialization time (UTC) reported by Open-Meteo, or None if unavailable."""
+    import requests
+    dataset = META_DATASET.get(source, source.value)
+    try:
+        r = requests.get(f"https://api.open-meteo.com/data/{dataset}/static/meta.json", timeout=5)
+        r.raise_for_status()
+        return datetime.fromtimestamp(r.json()["last_run_initialisation_time"], timezone.utc)
+    except Exception:
+        return None
+
+
+_run = published_model_run(DATA_SOURCE) or latest_model_run(DATA_SOURCE)
+DATA_UPDATE_STR = _run.strftime("%Y%m%d%H") + "z"
 
 # 计算日出/日落时间、太阳方位角与仰角
 sun = sun_event(city.latitude, city.longitude, DATE, EVENT, TIMEZONE)

@@ -223,3 +223,6 @@ __marimo__/
 .streamlit/secrets.toml
 # GFS fields downloaded from AWS
 gfs_aws/
+
+# Open-Meteo paced-download cache
+om_cache/

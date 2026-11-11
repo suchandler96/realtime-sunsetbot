@@ -54,7 +54,27 @@ def _forecast_hour(valid: datetime, run: datetime) -> int:
     return 3 * round(hours / 3) if hours > 120 else hours   # beyond f120 the bucket only has 3-hourly files
 
 
+_https_broken = False   # set once HTTPS to the bucket has failed: later requests go straight to plain HTTP
+
+
 def _get(url, headers=None, attempts=3, **kwargs):
+    """GET with retries.  If HTTPS to the bucket fails (connection / TLS errors), the same request is repeated over
+    plain HTTP (the data is public and not secret), and the rest of the run stays on HTTP."""
+    global _https_broken
+    if _https_broken and url.startswith("https://"):
+        url = "http://" + url[len("https://"):]
+    try:
+        return _get_with_retries(url, headers, attempts, **kwargs)
+    except requests.RequestException as exc:
+        if not url.startswith("https://"):
+            raise
+        print(f"HTTPS download from AWS failed ({type(exc).__name__}); trying plain HTTP ...")
+        response = _get_with_retries("http://" + url[len("https://"):], headers, attempts, **kwargs)
+        _https_broken = True
+        return response
+
+
+def _get_with_retries(url, headers=None, attempts=3, **kwargs):
     for attempt in range(attempts):
         try:
             response = requests.get(url, headers=headers, timeout=(10, 60), **kwargs)

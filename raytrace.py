@@ -220,3 +220,100 @@ class ProfileExtinction:
             if threshold_at is None and tau_cloud + tau_aerosol[REFERENCE] + tau_rayleigh[REFERENCE] > tau_stop:
                 threshold_at = float(xs[i])
         return result(threshold_at)
+
+    def integrate_many(self, ray_x, ray_ys, x_max=None, step_km=1.0, tau_stop=4.6, top_km=None):
+        """`integrate` for many rays that share one x grid at once: a list of `RayTransmittance`, one per row of `ray_ys`.
+
+        The rays of one observer cross the same model columns, so the nearest column of every sample and the height
+        interpolation of each field are done once per column for all rays together (about 46 numpy calls per field
+        instead of one per sample point), and the walk along the rays becomes cumulative sums.  The semantics are those
+        of `integrate`: target cell ignored, phase rules, stop at the model top, first blocking cell wins."""
+        ray_x = np.asarray(ray_x, dtype=float)
+        ray_ys = np.atleast_2d(np.asarray(ray_ys, dtype=float))
+        x_end = min(ray_x[-1], x_max if x_max is not None else ray_x[-1], self.distances[-1])
+        if top_km is None:
+            top_km = max(c[0][-1] for c in self._cloud_cover)
+        xs = np.arange(ray_x[0], x_end, step_km)
+        if len(xs) == 0 or xs[-1] < x_end:
+            xs = np.append(xs, x_end)
+        ys = np.array([np.interp(xs, ray_x, y) for y in ray_ys])          # (rays, samples)
+        shape = ys.shape
+        target_cell_exit = self._target_cell_exit(float(xs[0]))
+        nearest = np.argmin(np.abs(self.distances[None, :] - xs[:, None]), axis=1)   # nearest column of each x
+
+        def by_column(columns):
+            """Field at every sample: nearest column in x, linear in height."""
+            out = np.zeros(shape)
+            for j in np.unique(nearest):
+                sel = nearest == j
+                heights, values = columns[j]
+                out[:, sel] = np.interp(ys[:, sel], heights, values, left=0.0, right=0.0)
+            return out
+
+        cloud = by_column(self._cloud_cover)
+        temperature = by_column(self._temperature)
+        occupied = (xs > target_cell_exit)[None, :] & (cloud >= self.cloud_block_cover_percent)
+        if self._liquid is not None:   # phase and amount from the model's liquid / ice water
+            beta_liquid, beta_ice = by_column(self._liquid), by_column(self._ice)
+            water_block = occupied & (beta_liquid >= LIQUID_BLOCK_PER_KM)
+            ice_beta = np.where(occupied & ~water_block, beta_liquid + beta_ice, 0.0)
+        else:
+            cold = temperature <= ICE_ONLY_TEMP_C
+            ice_beta = np.where(occupied & cold, self.ice_extinction_per_km, 0.0)
+            water_block = occupied & ~cold
+        if self._aerosol is not None:
+            f = (xs - self.distances[0]) / (self.distances[1] - self.distances[0])
+            j0 = np.clip(np.floor(f).astype(int), 0, len(self.distances) - 2)
+            w = np.clip(f - j0, 0.0, 1.0)
+            aerosol = np.zeros(shape)
+            for j in np.unique(j0):
+                sel = j0 == j
+                a, b = self._aerosol[j], self._aerosol[j + 1]
+                aerosol[:, sel] = ((1 - w[sel]) * np.interp(ys[:, sel], a[0], a[1], left=0.0, right=0.0)
+                                   + w[sel] * np.interp(ys[:, sel], b[0], b[1], left=0.0, right=0.0))
+            aerosol = aerosol[..., None] * self._aerosol_scale             # (rays, samples, rgb)
+        else:
+            aerosol = np.zeros(shape + (3,))
+        rayleigh = np.exp(-np.maximum(ys, 0.0) / RAYLEIGH_SCALE_HEIGHT_KM)[..., None] * self._rayleigh_scale
+
+        # trapezoid optical depth up to every sample (index k = the step ending at sample k + 1)
+        ds = np.hypot(np.diff(xs)[None, :], np.diff(ys, axis=1))
+        cum_cloud = np.cumsum(0.5 * (ice_beta[:, :-1] + ice_beta[:, 1:]) * ds, axis=1)
+        cum_aerosol = np.cumsum(0.5 * (aerosol[:, :-1] + aerosol[:, 1:]) * ds[..., None], axis=1)
+        cum_rayleigh = np.cumsum(0.5 * (rayleigh[:, :-1] + rayleigh[:, 1:]) * ds[..., None], axis=1)
+        cum_reference = cum_cloud + cum_aerosol[..., REFERENCE] + cum_rayleigh[..., REFERENCE]
+
+        # the walk ends where the ray first leaves the model top; a blocking cell before that ends it earlier
+        over_top = ys[:, 1:] > top_km
+        steps = np.full(shape[0], shape[1] - 1)                          # usable steps per ray
+        if over_top.shape[1]:
+            steps = np.where(over_top.any(axis=1), over_top.argmax(axis=1), steps)
+        usable = np.arange(shape[1] - 1)[None, :] < steps[:, None]
+        blocking = water_block[:, 1:] & usable
+        results = []
+        for r in range(shape[0]):
+            blocked_by_cloud = bool(blocking[r].any())
+            if blocked_by_cloud:
+                last = int(blocking[r].argmax())
+                stopped_at = float(xs[last + 1])
+            else:
+                last = int(steps[r]) - 1
+                stopped_at = None
+                if last >= 0:
+                    above = cum_reference[r, :last + 1] > tau_stop
+                    if above.any():
+                        stopped_at = float(xs[int(above.argmax()) + 1])
+            if last >= 0:
+                tau_cloud, tau_aerosol, tau_rayleigh = cum_cloud[r, last], cum_aerosol[r, last], cum_rayleigh[r, last]
+            else:
+                tau_cloud, tau_aerosol, tau_rayleigh = 0.0, np.zeros(3), np.zeros(3)
+            tau = tau_cloud + tau_aerosol + tau_rayleigh
+            results.append(RayTransmittance(
+                tuple(float(t) for t in (np.zeros(3) if blocked_by_cloud else np.exp(-tau))),
+                float("inf") if blocked_by_cloud else float(tau_cloud),
+                float(tau_aerosol[REFERENCE]),
+                float(tau_rayleigh[REFERENCE]),
+                stopped_at,
+                blocked_by_cloud,
+            ))
+        return results

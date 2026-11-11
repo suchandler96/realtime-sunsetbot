@@ -61,6 +61,50 @@ liquid and ice water, so the figure shows the cloud phase (liquid / mixed / ice)
 uses it. With Open-Meteo data (all other sources, or `GFS_AWS` when the download fails) there is no cloud phase and
 the old temperature rule decides which cloud blocks light.
 
+## Code layout
+
+`main.py` is the command line and the figure. Everything that computes (transect geometry, the weather fetch, the
+profile arrays, cloud-base detection, light-ray tracing and transmittance) lives in `sunset_core.py` and has no
+plotting, so other tools can reuse it. `fetch_weather_batch()` fetches the profiles of one or many transects in one
+batched request (Open-Meteo: chunked requests that wait out the minutely quota; AWS GFS: one set of GRIB fields
+sampled at all points) and returns one `WeatherResult` per transect; a batch of one is the plain single fetch.
+
+## Vividness map
+
+`vividness_map.py` scores observers over a region (0-100) with the same ray tracing as `main.py` and overlays the
+result on an `images/base_*.png` radar base map:
+
+```
+python vividness_map.py --region AECN --event sunset --date 2026-11-12 --data-source GFS_AWS --save
+```
+
+A point's score = local cloud cover x best 3-minute sliding mean (rays 0.5 min apart) of ray brightness
+(green transmittance, logarithmic) x ray colour (red/blue transmittance); the thresholds are constants at the top of
+the file. It says how well the cloud base over each point is lit; there is no smoothing over neighbouring points.
+An observer with no level reaching the `CLOUD_PRESENT_*` constants (cloud cover / relative humidity) is skipped
+(score 0) before anything else is computed; the cloud base of the others is found with `main.py`'s 50 % / 99 %
+thresholds.
+
+**Layout (`--layout`).** The default, `sunlines`, puts the observers on lines that follow the sun azimuth, so that
+neighbours share one cross-section (`sunlines.py` describes it in detail):
+lines start on the region's sun-facing edges every `--cross-km` (20), observers sit every `--along-km` (20, a
+multiple of the 20 km model-column step) along each line, and observers within `--share-km` (100) of a group's
+first observer use that observer's cross-section: weather and terrain are fetched once and each observer takes the
+slice from its own position (terrain is read on a 1 km grid, so the slices are exact). A group never mixes two
+forecast hours (AWS GFS gives one hour per request). The azimuth drifts with distance, so sharing is an
+approximation: it is exact for the same points (checked). The shared line follows the azimuth of the group's middle
+observer; against each observer's own azimuth (measured at 60 km spacing, no terrain) 93 % of the scores are
+identical at `--share-km 100` and 2 of 790 differ by more than 5 points; at 300 km 30 of 791 do (a cloud edge can fall
+on either side of a ray). On AECN at the defaults, 6900 observers need 5.0x fewer model
+columns than one cross-section each (about 3 min in total, of which the sun-event calculation for every observer
+takes about 80 s).
+The cells are drawn rotated to the azimuth; where neighbouring lines converge they overlap (the higher score on top)
+and where they diverge there are gaps. `--layout grid` is the older lat/lon grid (`--step-deg`), one cross-section
+per point.
+
+`--save` also writes the scores to a `.npz` that `--from-npz` redraws. Use `GFS_AWS`
+for maps: Open-Meteo rate-limits big batches.
+
 ## E-mail service
 
 `email/` answers forecast requests sent by e-mail; see `email/README.md`. `email/config.toml` holds

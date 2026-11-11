@@ -41,6 +41,8 @@ PRESSURE_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 
 ALTITUDES_KM = [0.1, 0.2, 0.4, 0.6, 0.8, 1.5, 2.0, 3.0, 4.2, 5.6, 7.2, 9.2, 10.4, 11.8, 13.6, 16.2]
 
 CLOUD_WATER_MIN = 1e-8    # kg/kg; below this a cell counts as having no cloud water
+CLOUD_BASE_RH_MIN = 99.0      # a level with at least this relative humidity (%) counts as cloudy ...
+CLOUD_BASE_COVER_MIN = 50.0   # ... and so does one with at least this cloud cover (%)
 
 # Model initialisation time estimate (UTC cycle) when the real run time is unknown.
 MODEL_CYCLE_HOURS = {DataSource.GFS: 6, DataSource.GFS_AWS: 6, DataSource.ECMWF: 12, DataSource.JMA_MSM: 3,
@@ -96,6 +98,7 @@ class Transect:
     x_min: float
     x_max: float
     step_km: float
+    line_azimuth: float | None = None   # direction of the line when it is not the observer's own sun azimuth
 
     @property
     def timezone(self) -> str:
@@ -103,7 +106,8 @@ class Transect:
 
     @property
     def azimuth(self) -> float:
-        return self.sun.position.azimuth
+        """Direction of the transect: the observer's sun azimuth unless the line was laid in another direction."""
+        return self.sun.position.azimuth if self.line_azimuth is None else self.line_azimuth
 
     @property
     def sun_elevation(self) -> float:
@@ -115,14 +119,20 @@ class Transect:
 
 
 def make_transect(city, date: str, event: str, x_min: float = X_MIN, x_max: float = X_MAX,
-                  step_km: float = STEP_KM) -> Transect:
-    sun = sun_event(city.latitude, city.longitude, date, event, city.timezone)
+                  step_km: float = STEP_KM, sun: SunEvent | None = None, azimuth: float | None = None) -> Transect:
+    """The observer's transect towards the sun.  Pass `sun` when the observer's event is already known, and
+    `azimuth` to lay the line in another direction than the observer's own sun azimuth (a map's observers that share
+    one cross-section)."""
+    if sun is None:
+        sun = sun_event(city.latitude, city.longitude, date, event, city.timezone)
     r_earth = earth_radius_km(city.latitude)
+    direction = sun.position.azimuth if azimuth is None else azimuth
     distances = np.arange(x_min, x_max + step_km, step_km)
-    lats, lons = zip(*(get_point_at_distance(city.latitude, city.longitude, d, sun.position.azimuth, r_earth)
+    lats, lons = zip(*(get_point_at_distance(city.latitude, city.longitude, d, direction, r_earth)
                        for d in distances))
     return Transect(city=city, date=date, event=event, sun=sun, r_earth=r_earth, distances=distances,
-                    lats=list(lats), lons=list(lons), x_min=x_min, x_max=x_max, step_km=step_km)
+                    lats=list(lats), lons=list(lons), x_min=x_min, x_max=x_max, step_km=step_km,
+                    line_azimuth=azimuth)
 
 
 # ==================== model run time ====================
@@ -174,14 +184,15 @@ def request_profile(source: DataSource, lats, lons, date: str, tz: str, valid_at
 
 
 def fetch_weather_batch(transects: list[Transect], source: DataSource, valid_at=None,
-                        log=print) -> tuple[list[WeatherResult], DataSource]:
+                        log=print, openmeteo_backend=None) -> tuple[list[WeatherResult], DataSource]:
     """Fetch the profiles of one or many transects with a single batched request; one `WeatherResult` per transect.
 
     All transects must share the local date and time zone (one request has one of each).  `valid_at` is the moment
     single-time backends (AWS GFS: one forecast hour per request) are asked for; by default the middle of the
     transects' event times, which for one transect is simply its own event time.  Open-Meteo returns the whole
     day, and `build_profile` picks each transect's own hour.  `GFS_AWS` falls back to Open-Meteo's GFS for the
-    whole batch when the AWS download fails.  Returns the results and the data source actually used."""
+    whole batch when the AWS download fails.  `openmeteo_backend` replaces the plain Open-Meteo backend (e.g. the
+    quota-paced, caching `openmeteo_paced.PacedOpenMeteoBackend` for big batches).  Returns the results and the data source actually used."""
     if not transects:
         raise ValueError("at least one transect is required")
     if len({(t.date, t.timezone) for t in transects}) != 1:
@@ -201,7 +212,7 @@ def fetch_weather_batch(transects: list[Transect], source: DataSource, valid_at=
             log(f"GFS download from AWS failed ({exc}); using Open-Meteo GFS instead (no cloud phase)")
             source = DataSource.GFS
     if weather is None:
-        weather = request_profile(source, lats, lons, first.date, first.timezone, valid_at)
+        weather = request_profile(source, lats, lons, first.date, first.timezone, valid_at, backend=openmeteo_backend)
     if weather.model_run is not None:   # the run really used, not an estimate
         log(f"GFS from AWS: run {weather.model_run:%Y-%m-%d %Hz} (plain global GFS, with cloud liquid/ice water)")
 
@@ -242,10 +253,14 @@ class Profile:
     has_cloud_phase: bool = False
 
 
-def load_terrain(transect: Transect, log=print):
-    """DEM heights (km) along the transect, or None if the download fails."""
-    terrain_distances = np.arange(transect.x_min, transect.x_max + TERRAIN_STEP_KM, TERRAIN_STEP_KM)
-    t_lats, t_lons = points_along(transect, terrain_distances)
+def terrain_points(transect: Transect, step_km: float = TERRAIN_STEP_KM):
+    """(lats, lons) of the points along the transect where the DEM is read, every `step_km`."""
+    return points_along(transect, np.arange(transect.x_min, transect.x_max + step_km, step_km))
+
+
+def load_terrain(transect: Transect, log=print, step_km: float = TERRAIN_STEP_KM):
+    """DEM heights (km) along the transect every `step_km`, or None if the download fails."""
+    t_lats, t_lons = terrain_points(transect, step_km)
     try:
         return terrain.read_elevation(t_lats, t_lons)
     except Exception as exc:  # network problems must not kill the weather figure
@@ -253,12 +268,14 @@ def load_terrain(transect: Transect, log=print):
         return None
 
 
-def detect_cloud_base(distances, height_km, underground, rh, cloud, observer_index, log=print):
-    """First level above the observer with saturated air or sizeable cloud; None when the sky is clear."""
+def detect_cloud_base(distances, height_km, underground, rh, cloud, observer_index, log=print,
+                      rh_min=CLOUD_BASE_RH_MIN, cover_min=CLOUD_BASE_COVER_MIN):
+    """First level above the observer with relative humidity >= `rh_min` or cloud cover >= `cover_min` (percent);
+    None when the sky counts as clear."""
     obs = observer_index
     rh_at_observer = np.where(underground[:, obs], np.nan, rh[:, obs])
     cloud_at_observer = np.where(underground[:, obs], np.nan, cloud[:, obs])
-    cloud_layer_mask = (rh_at_observer >= 99) | (cloud_at_observer >= 50)
+    cloud_layer_mask = (rh_at_observer >= rh_min) | (cloud_at_observer >= cover_min)
     if not np.any(cloud_layer_mask):
         return None  # clear sky: no default cloud base, no rays and no integration
     k = int(np.argmax(cloud_layer_mask))
@@ -267,8 +284,8 @@ def detect_cloud_base(distances, height_km, underground, rh, cloud, observer_ind
     # are crossed (consistent with the cloud-region edge in the figure)
     if k > 0 and not np.isnan(rh_at_observer[k - 1]):
         crossings = []
-        for below, here, threshold in ((rh_at_observer[k - 1], rh_at_observer[k], 99.0),
-                                       (cloud_at_observer[k - 1], cloud_at_observer[k], 50.0)):
+        for below, here, threshold in ((rh_at_observer[k - 1], rh_at_observer[k], rh_min),
+                                       (cloud_at_observer[k - 1], cloud_at_observer[k], cover_min)):
             if here >= threshold > below:
                 crossings.append(height_km[k - 1, obs]
                                  + (threshold - below) / (here - below) * (height_km[k, obs] - height_km[k - 1, obs]))
@@ -279,46 +296,49 @@ def detect_cloud_base(distances, height_km, underground, rh, cloud, observer_ind
     return local_cbh_km
 
 
-def build_profile(transect: Transect, weather: WeatherResult, cloud_base_km: float = -1.0,
-                  include_terrain: bool = True, terrain_km=None, log=print) -> Profile:
-    """Turn one transect's `WeatherResult` into the arrays used for ray tracing and plotting.
-
-    `cloud_base_km` < 0 detects the cloud base above the observer; otherwise it is taken as given.  Terrain is
-    downloaded unless `terrain_km` (DEM heights along the transect at TERRAIN_STEP_KM) is supplied or
-    `include_terrain` is False."""
-    distances = transect.distances
+def _level_fields(transect: Transect, weather: WeatherResult):
+    """Fields at the event hour shared by profile building and the cheap cloud check: (time index, level heights km
+    [level, point], the model's terrain km [point], underground mask, relative humidity, cloud cover, temperature)."""
     time_idx = weather.nearest_index(transect.sun.time)   # the hour closest to the event
 
     # True geopotential height of every level at every point; fall back to the approximate table where missing
     height_km = weather.values("geopotential_height")[:, :, time_idx] / 1000.0
     height_km = np.where(np.isnan(height_km), np.asarray(ALTITUDES_KM)[:, None], height_km)
 
-    # Terrain along the profile; the observer stands at the local elevation at x = 0
-    terrain_distances = np.arange(transect.x_min, transect.x_max + TERRAIN_STEP_KM, TERRAIN_STEP_KM)
-    observer_km = 0.0
-    if include_terrain and terrain_km is None:
-        terrain_km = load_terrain(transect, log)
-    elif not include_terrain:
-        terrain_km = None
-    if terrain_km is not None:
-        observer_km = float(np.interp(0.0, terrain_distances, terrain_km))
-        log(f"Terrain: observer at {observer_km * 1000:.0f} m; profile {terrain_km.min() * 1000:.0f}"
-            f"-{terrain_km.max() * 1000:.0f} m")
     # The model's own (smooth) terrain; levels below it are extrapolated data.  The figure covers them with the
     # ground fill up to the higher of DEM and model terrain instead of masking them with NaN (which would leave
     # white areas near the terrain); the cloud-base detection excludes them directly.
     model_terrain_km = np.nan_to_num(weather.model_elevation_km, nan=0.0)
     underground = height_km < model_terrain_km[None, :]
-    ground_top_km = None
-    if terrain_km is not None:
-        ground_top_km = np.maximum(terrain_km, np.interp(terrain_distances, distances, model_terrain_km))
-        log(f"Model terrain: {model_terrain_km.min() * 1000:.0f}-{model_terrain_km.max() * 1000:.0f} m "
-            f"(observer cell {model_terrain_km[distances == 0][0] * 1000:.0f} m)")
 
     # Relative humidity, cloud cover and temperature [level, point] at the event hour
     rh = weather.values("relative_humidity")[:, :, time_idx]
     cloud = weather.values("cloud_cover")[:, :, time_idx]
     temp = weather.values("temperature")[:, :, time_idx]
+    return time_idx, height_km, model_terrain_km, underground, rh, cloud, temp
+
+
+def cloud_present_over_observer(transect: Transect, weather: WeatherResult, rh_min: float, cover_min: float) -> bool:
+    """Cheap pre-check: does any level over the observer (above the model's terrain) have relative humidity >=
+    `rh_min` or cloud cover >= `cover_min` (percent)?  It builds nothing else, so a map can drop cloud-free
+    observers before the real work; the cloud base itself is then found by `build_profile`."""
+    _, height_km, _, underground, rh, cloud, _ = _level_fields(transect, weather)
+    return detect_cloud_base(transect.distances, height_km, underground, rh, cloud, transect.observer_index,
+                             log=_quiet, rh_min=rh_min, cover_min=cover_min) is not None
+
+
+def build_profile(transect: Transect, weather: WeatherResult, cloud_base_km: float = -1.0,
+                  include_terrain: bool = True, terrain_km=None, lazy_terrain: bool = False, log=print) -> Profile:
+    """Turn one transect's `WeatherResult` into the arrays used for ray tracing and plotting.
+
+    `cloud_base_km` < 0 detects the cloud base above the observer (a level with relative humidity >=
+    CLOUD_BASE_RH_MIN or cloud cover >= CLOUD_BASE_COVER_MIN); otherwise it is taken as given.  Terrain is
+    downloaded unless `terrain_km` (DEM heights along the transect at TERRAIN_STEP_KM) is supplied or
+    `include_terrain` is False; `terrain_km` may also be a function without arguments that returns that array (or
+    None), called only when the terrain is really needed.  With `lazy_terrain` the cloud base is detected first and a clear sky skips the
+    terrain altogether (no cloud base means no rays; the profile then has no terrain), which is what a map wants."""
+    distances = transect.distances
+    time_idx, height_km, model_terrain_km, underground, rh, cloud, temp = _level_fields(transect, weather)
     has_cloud_phase = "cloud_ice_water" in weather.variables   # only native-model (AWS GFS) data carries it
     cloud_liquid = cloud_ice = ice_fraction = None
     if has_cloud_phase:
@@ -329,11 +349,34 @@ def build_profile(transect: Transect, weather: WeatherResult, cloud_base_km: flo
         ice_fraction = np.where(condensate > CLOUD_WATER_MIN,
                                 np.nan_to_num(cloud_ice) / np.maximum(condensate, 1e-30), np.nan)
 
-    if cloud_base_km < 0:
-        local_cbh_km = detect_cloud_base(distances, height_km, underground, rh, cloud,
-                                         transect.observer_index, log)
-    else:
+    detect_first = lazy_terrain and cloud_base_km < 0
+    local_cbh_km = None
+    if detect_first:
+        local_cbh_km = detect_cloud_base(distances, height_km, underground, rh, cloud, transect.observer_index, log)
+        include_terrain = include_terrain and local_cbh_km is not None
+
+    # Terrain along the profile; the observer stands at the local elevation at x = 0
+    terrain_distances = np.arange(transect.x_min, transect.x_max + TERRAIN_STEP_KM, TERRAIN_STEP_KM)
+    observer_km = 0.0
+    if include_terrain and callable(terrain_km):
+        terrain_km = terrain_km()
+    elif include_terrain and terrain_km is None:
+        terrain_km = load_terrain(transect, log)
+    elif not include_terrain:
+        terrain_km = None
+    ground_top_km = None
+    if terrain_km is not None:
+        observer_km = float(np.interp(0.0, terrain_distances, terrain_km))
+        log(f"Terrain: observer at {observer_km * 1000:.0f} m; profile {terrain_km.min() * 1000:.0f}"
+            f"-{terrain_km.max() * 1000:.0f} m")
+        ground_top_km = np.maximum(terrain_km, np.interp(terrain_distances, distances, model_terrain_km))
+        log(f"Model terrain: {model_terrain_km.min() * 1000:.0f}-{model_terrain_km.max() * 1000:.0f} m "
+            f"(observer cell {model_terrain_km[distances == 0][0] * 1000:.0f} m)")
+
+    if cloud_base_km >= 0:
         local_cbh_km = cloud_base_km
+    elif not detect_first:
+        local_cbh_km = detect_cloud_base(distances, height_km, underground, rh, cloud, transect.observer_index, log)
 
     return Profile(transect=transect, weather=weather, time_idx=time_idx, height_km=height_km,
                    underground=underground, model_terrain_km=model_terrain_km, terrain_distances=terrain_distances,
@@ -499,9 +542,9 @@ def trace_rays(profile: Profile, aerosol_profile=None, aerosol_height_km=None, a
         log(f"Direct transmittance of {len(scan_delays)} light rays "
             f"(water-cloud blocking + Beer-Lambert ice cloud/CAMS aerosol/Rayleigh); "
             f"{percent(ray_min_transmittance)} is a direct-beam reporting threshold, not a sunset-glow boundary:")
-        scan_results = [extinction_model.integrate(
-            ray_x_fine, trace.ray_y_at(ray_x_fine, d),
-            tau_stop=-math.log(max(ray_min_transmittance, 1e-6))) for d in scan_delays]
+        scan_results = extinction_model.integrate_many(
+            ray_x_fine, [trace.ray_y_at(ray_x_fine, d) for d in scan_delays],
+            tau_stop=-math.log(max(ray_min_transmittance, 1e-6)))
     trace.scan_delays, trace.scan_results = scan_delays, scan_results
 
     shown = [r is None or r.transmittance >= ray_min_transmittance for r in scan_results]

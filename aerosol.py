@@ -6,7 +6,10 @@ Credentials are read by cdsapi from ~/.cdsapirc (url https://ads.atmosphere.cope
 """
 import glob
 import os
+import sys
+import time
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +23,7 @@ RUN_HOURS = (0, 12)          # forecast base times offered by the dataset
 MAX_LEAD_HOURS = 120
 LEAD_STEP_HOURS = 3
 RUN_DELAY_HOURS = 8          # approximate time before a run shows up on ADS
+SKIP_NEWEST_RUNS = 1         # start one cycle earlier than the estimate: a run that is not published yet is rejected (400)
 CACHE_DIR = "cams_ads"
 
 
@@ -33,10 +37,11 @@ class AerosolProfile:
 
 
 def candidate_runs(now=None, count=4):
-    """Newest-first base times that may already be available."""
+    """Newest-first base times that should already be available (the newest estimate is skipped, see SKIP_NEWEST_RUNS)."""
     available = (now or datetime.now(timezone.utc)) - timedelta(hours=RUN_DELAY_HOURS)
     run = available.replace(hour=max(h for h in RUN_HOURS if h <= available.hour),
                             minute=0, second=0, microsecond=0)
+    run -= timedelta(hours=24 // len(RUN_HOURS)) * SKIP_NEWEST_RUNS
     runs = [run]
     while len(runs) < count:
         run -= timedelta(hours=24 // len(RUN_HOURS))
@@ -55,6 +60,102 @@ def _area(lats, lons, margin=1.0):
     lons = (np.asarray(lons, dtype=float) + 180.0) % 360.0 - 180.0
     return [min(90.0, float(np.max(lats)) + margin), max(-180.0, float(lons.min()) - margin),
             max(-90.0, float(np.min(lats)) - margin), min(180.0, float(lons.max()) + margin)]
+
+
+def _rate(bytes_per_s):
+    return f"{bytes_per_s / 1e6:6.2f} MB/s" if bytes_per_s >= 1e6 else f"{bytes_per_s / 1e3:6.0f} KB/s"
+
+
+def _size(n, unit=None):
+    unit = unit or ("MB" if n >= 1e6 else "KB")
+    return f"{n / (1e6 if unit == 'MB' else 1e3):.1f}"
+
+
+class _StatusLine:
+    """One live line (rewritten in place on a terminal; a new line every `period` seconds otherwise)."""
+
+    def __init__(self, period=10.0):
+        self.interactive = sys.stdout.isatty()
+        self.period = period
+        self.last = 0.0
+
+    def show(self, text, force=False):
+        now = time.time()
+        if self.interactive:
+            if now - self.last >= 0.25 or force:
+                print("\r" + text.ljust(79), end="", flush=True)
+                self.last = now
+        elif now - self.last >= self.period or force:
+            print(text, flush=True)
+            self.last = now
+
+    def clear(self):
+        if self.interactive:
+            print("\r" + " " * 79 + "\r", end="", flush=True)
+
+
+def _fetch(cdsapi, label, request, zip_path, attempts=3):
+    """Submit the ADS request, wait in the queue showing its state, then download with live progress."""
+    import requests
+    client = cdsapi.Client(quiet=True, wait_until_complete=False)
+    remote = client.retrieve(DATASET, request)
+    if not hasattr(remote, "get_results"):  # an old-style cdsapi server: no queue/progress hooks
+        remote.download(zip_path)
+        return
+    started, line, last_status = time.time(), _StatusLine(30.0), None
+    sleep = 1.0
+    try:
+        while not remote.results_ready:  # raises with the server's full message if the job failed
+            status = remote.last_status
+            waited = int(time.time() - started)
+            line.show(f"{label}  {'queued' if status == 'accepted' else status} on ADS, {waited // 60}:{waited % 60:02d} elapsed",
+                      force=status != last_status)
+            last_status = status
+            time.sleep(sleep)
+            sleep = min(sleep * 1.5, 5.0)
+    finally:
+        line.clear()
+    results = remote.get_results()
+    url, expected = results.location, results.content_length
+    verify = results.request_options.get("verify", True)
+    part, got = zip_path + ".part", 0
+    started, line = time.time(), _StatusLine(10.0)
+    try:
+        for attempt in range(1, attempts + 1):
+            headers = {"Range": f"bytes={got}-"} if got else {}
+            try:
+                with requests.get(url, stream=True, headers=headers, timeout=(15, 60), verify=verify) as resp:
+                    resp.raise_for_status()
+                    if got and resp.status_code != 206:  # the server ignored the range: start over
+                        got = 0
+                    recent = deque([(time.time(), got)])
+                    with open(part, "ab" if got else "wb") as f:
+                        for chunk in resp.iter_content(1 << 16):
+                            f.write(chunk)
+                            got += len(chunk)
+                            now = time.time()
+                            recent.append((now, got))
+                            while len(recent) > 2 and now - recent[0][0] > 2:
+                                recent.popleft()
+                            speed = (got - recent[0][1]) / max(now - recent[0][0], 1e-3)
+                            unit = "MB" if expected >= 1e6 else "KB"
+                            line.show(f"{label}  {_size(got, unit):>6}/{_size(expected, unit)} {unit} {got / expected:4.0%}  {_rate(speed)}")
+                if got >= expected:
+                    break
+                raise requests.ConnectionError(f"incomplete: {got} of {expected} bytes")
+            except requests.RequestException as exc:
+                line.clear()
+                if attempt == attempts:
+                    raise
+                print(f"{label}  download interrupted at {_size(got)}/{_size(expected)} ({exc}); resuming ({attempt}/{attempts})")
+                time.sleep(5)
+        os.replace(part, zip_path)
+    finally:
+        line.clear()
+        if os.path.exists(part):
+            os.remove(part)
+    elapsed = max(time.time() - started, 1e-3)
+    print(f"{label}  downloaded {_size(expected)} {'MB' if expected >= 1e6 else 'KB'}  {_rate(expected / elapsed).strip()}")
 
 
 def _download(run, leads, wavelength_nm, area, cache_dir):
@@ -77,7 +178,7 @@ def _download(run, leads, wavelength_nm, area, cache_dir):
         "area": area,
     }
     zip_path = os.path.join(cache_dir, tag + ".zip")
-    cdsapi.Client(quiet=True).retrieve(DATASET, request).download(zip_path)
+    _fetch(cdsapi, f"CAMS {run:%Y-%m-%d %Hz}", request, zip_path)
     with zipfile.ZipFile(zip_path) as archive:
         members = [m for m in archive.namelist() if m.endswith(".nc")]
         if not members:
@@ -149,7 +250,8 @@ def read_extinction(valid, lats, lons, wavelength_nm=532, cache_dir=CACHE_DIR, n
         try:
             path = _download(run, leads, wavelength_nm, area, cache_dir)
         except Exception as exc:  # run not published yet / network / credentials
-            print(f"CAMS run {run:%Y-%m-%d %Hz}: {str(exc).strip()[:160]}")
+            detail = str(exc).strip().replace("\n", "\n    ")  # the whole message: ADS puts the reason after the URL
+            print(f"CAMS run {run:%Y-%m-%d %Hz}: {detail}")
             continue
         data, glat, glon, glev = _read(path)
         if data.shape[0] != len(leads):

@@ -21,6 +21,7 @@ from weather_data import DataSource, WeatherData
 from cities import resolve_city, custom_city, CityLookupError
 from satellite import get_source, SOURCES
 import fy4b
+import gfs_aws
 import aerosol
 import raytrace
 import terrain
@@ -50,8 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date", default=date.today().strftime('%Y-%m-%d'), help="local date YYYY-MM-DD")
     parser.add_argument("--event", default="sunset", choices=["sunrise", "sunset"],
                         help="which solar event to plot")
-    parser.add_argument("--data-source", default=DataSource.GFS.name,
-                        choices=[s.name for s in DataSource], help="weather model: GFS, ECMWF, JMA_MSM, CMA_GFS, HRRR")
+    parser.add_argument("--data-source", default=DataSource.GFS.name, type=str.upper,
+                        choices=[s.name for s in DataSource],
+                        help="weather model (case-insensitive): GFS = Open-Meteo gfs_seamless blend; "
+                             "GFS_AWS = plain GFS from NOAA's public AWS bucket, with cloud liquid/ice water so "
+                             "the figure shows cloud phase (falls back to GFS if the download fails); "
+                             "ECMWF, JMA_MSM, CMA_GFS, HRRR via Open-Meteo")
     parser.add_argument("--cloud-base", type=float, default=-1,
                         help="manual cloud base height in km")
     parser.add_argument("--satellite", action=argparse.BooleanOptionalAction, default=False,
@@ -185,9 +190,9 @@ SAVE_FIGURE = args.save
 
 # 模型数据更新时间估算 (UTC 起报时刻)。
 # Open-Meteo 标准 forecast 接口不直接返回起报时刻，这里按当前时间与模型循环周期估算。
-MODEL_CYCLE_HOURS = {DataSource.GFS: 6, DataSource.ECMWF: 12, DataSource.JMA_MSM: 3,
+MODEL_CYCLE_HOURS = {DataSource.GFS: 6, DataSource.GFS_AWS: 6, DataSource.ECMWF: 12, DataSource.JMA_MSM: 3,
                      DataSource.CMA_GFS: 6, DataSource.HRRR: 1}
-MODEL_RUN_DELAY_HOURS = {DataSource.GFS: 5, DataSource.ECMWF: 9, DataSource.JMA_MSM: 2,
+MODEL_RUN_DELAY_HOURS = {DataSource.GFS: 5, DataSource.GFS_AWS: 4, DataSource.ECMWF: 9, DataSource.JMA_MSM: 2,
                          DataSource.CMA_GFS: 6, DataSource.HRRR: 2}
 
 
@@ -200,7 +205,7 @@ def latest_model_run(source):
 
 
 # Open-Meteo publishes the real run time per dataset (gfs_seamless is a blend; use the global GFS).
-META_DATASET = {DataSource.GFS: "ncep_gfs013"}
+META_DATASET = {DataSource.GFS: "ncep_gfs013", DataSource.GFS_AWS: "ncep_gfs013"}
 
 
 def published_model_run(source):
@@ -236,6 +241,12 @@ radar_distances = np.arange(X_MIN, X_MAX + RADAR_STEP_KM, RADAR_STEP_KM)
 PRESSURE_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200, 150, 100]
 # Approximate heights; only a fallback when the model gives no geopotential height.
 ALTITUDES_KM = [0.1, 0.2, 0.4, 0.6, 0.8, 1.5, 2.0, 3.0, 4.2, 5.6, 7.2, 9.2, 10.4, 11.8, 13.6, 16.2]
+
+# Cloud phase (only with data carrying cloud liquid/ice water): ice share of the cloud-water mass
+CLOUD_WATER_MIN = 1e-8                 # kg/kg; below this the cell is treated as having no cloud water
+PHASE_CLASSES = [("Liquid cloud", 0.0, 0.2, "///", "tab:blue"),
+                 ("Mixed-phase cloud", 0.2, 0.8, "xxx", "tab:green"),
+                 ("Ice cloud", 0.8, 1.0001, "...", "tab:purple")]   # (label, ice fraction from, to, hatch, colour)
 
 # 相对湿度色标 (与 ExampleProfile.png 一致)
 RH_BOUNDS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99, 100]
@@ -275,18 +286,35 @@ print(
     f"正在获取 {DATE} {EVENT} 的相对湿度与云量剖面 "
     f"({DATA_SOURCE.value}, az={AZIMUTH:.1f}°, elev={SUN_ELEVATION:.2f}°) ..."
 )
-weather = (
-    WeatherData.source(DATA_SOURCE)
-    .coordinates(lats, lons)
-    .pressure_levels(PRESSURE_LEVELS)
-    .relative_humidity()
-    .cloud_cover()
-    .temperature()
-    .geopotential_height()
-    .timezone(TIMEZONE)
-    .on(DATE)
-    .fetch()
-)
+def request_profile(backend=None, cloud_water=False):
+    request = (
+        WeatherData.source(DATA_SOURCE, backend=backend)
+        .coordinates(lats, lons)
+        .pressure_levels(PRESSURE_LEVELS)
+        .relative_humidity()
+        .cloud_cover()
+        .temperature()
+        .geopotential_height()
+        .timezone(TIMEZONE)
+        .on(DATE)
+        .valid_at(sun.time)
+    )
+    return (request.cloud_water() if cloud_water else request).fetch()
+
+
+weather = None
+if DATA_SOURCE is DataSource.GFS_AWS:
+    try:
+        weather = request_profile(gfs_aws.GfsAwsBackend(), cloud_water=True)
+    except Exception as exc:  # network / bucket problems must not kill the figure: use Open-Meteo's GFS instead
+        print(f"GFS download from AWS failed ({exc}); using Open-Meteo GFS instead (no cloud phase)")
+        DATA_SOURCE = DataSource.GFS
+if weather is None:
+    weather = request_profile()
+HAS_CLOUD_PHASE = "cloud_ice_water" in weather.variables   # only the native-model (AWS GFS) data carries it
+if weather.model_run is not None:   # the run really used, not an estimate
+    DATA_UPDATE_STR = weather.model_run.strftime("%Y%m%d%H") + "z"
+    print(f"GFS from AWS: run {weather.model_run:%Y-%m-%d %Hz} (plain global GFS, with cloud liquid/ice water)")
 
 print(f"Computed {EVENT} time: {sun.time:%Y-%m-%d %H:%M:%S %Z}")
 
@@ -362,6 +390,13 @@ else:
 rh_matrix = weather.values("relative_humidity")[:, :, time_idx]
 cloud_matrix = weather.values("cloud_cover")[:, :, time_idx]
 temp_matrix = weather.values("temperature")[:, :, time_idx]
+cloud_liquid_matrix = cloud_ice_matrix = ice_fraction = None
+if HAS_CLOUD_PHASE:
+    cloud_liquid_matrix = weather.values("cloud_liquid_water")[:, :, time_idx]
+    cloud_ice_matrix = weather.values("cloud_ice_water")[:, :, time_idx]
+    condensate = np.nan_to_num(cloud_liquid_matrix) + np.nan_to_num(cloud_ice_matrix)
+    # ice share of the cloud water mass; NaN where the model holds no cloud water
+    ice_fraction = np.where(condensate > CLOUD_WATER_MIN, np.nan_to_num(cloud_ice_matrix) / np.maximum(condensate, 1e-30), np.nan)
 
 # 3.3 卫星云顶信息：通过 SATELLITE_SOURCE 选择数据源，并沿剖面采样 (可选)
 cloud_top_temp_c = None
@@ -463,7 +498,19 @@ cbar = fig.colorbar(contour, ax=ax, ticks=RH_BOUNDS)
 cbar.set_label('Relative Humidity (%)', fontsize=11)
 
 # 4.1b 叠加云量：云量 >= 50% 的区域以斜线阴影表示，低云也能显示出来
-ax.contourf(X, Y, cloud_matrix, levels=[50, 101], colors='none', hatches=['///'])
+if ice_fraction is None:
+    ax.contourf(X, Y, cloud_matrix, levels=[50, 101], colors='none', hatches=['///'])
+else:   # one hatch per cloud phase; each class is contoured from the cloud cover itself (like the single hatch),
+    # because masking cells without cloud water would erase layers only one pressure level thick
+    for _label, low, high, hatch, colour in PHASE_CLASSES:
+        in_class = (cloud_matrix >= 50) & (ice_fraction >= low) & (ice_fraction < high)
+        if in_class.any():
+            with plt.rc_context({'hatch.color': colour}):
+                ax.contourf(X, Y, np.where(in_class, cloud_matrix, 0.0), levels=[50, 101], colors='none', hatches=[hatch])
+    no_water = (cloud_matrix >= 50) & np.isnan(ice_fraction)   # cloudy by the cover field, but no cloud water in the model
+    if no_water.any():
+        with plt.rc_context({'hatch.color': 'dimgray'}):
+            ax.contourf(X, Y, np.where(no_water, cloud_matrix, 0.0), levels=[50, 101], colors='none', hatches=['\\\\'])
 ax.contour(X, Y, cloud_matrix, levels=[50], colors='dimgray', linewidths=0.6, alpha=0.7, zorder=1.2)
 
 # 4.1c 叠加等温线 (每隔 5°C)
@@ -634,7 +681,10 @@ else:
         extinction_model = raytrace.ProfileExtinction(
             distances, height_km, cloud_matrix, temp_matrix, underground=underground,
             aerosol_extinction=None if aerosol_profile is None else aerosol_profile.extinction_per_km,
-            aerosol_heights_km=aerosol_height_km, wavelength_nm=AEROSOL_WAVELENGTH)
+            aerosol_heights_km=aerosol_height_km, wavelength_nm=AEROSOL_WAVELENGTH,
+            **(dict(zip(("liquid_extinction", "ice_extinction"), raytrace.condensate_extinction(
+                np.asarray(PRESSURE_LEVELS, dtype=float)[:, None], temp_matrix, cloud_liquid_matrix,
+                cloud_ice_matrix, cloud_matrix))) if HAS_CLOUD_PHASE else {}))
         if aerosol_profile is None:
             print("Transmittance: no aerosol data (use --aerosol); only cloud and Rayleigh extinction are integrated.")
     ray_x_fine = np.arange(0.0, X_MAX + 0.5, 1.0)
@@ -758,8 +808,16 @@ ax.set_xlim(X_MIN, X_MAX)
 ax.set_ylim(0, 16) # 对流层高度
 ax.grid(True, linestyle=':', alpha=0.5)
 handles, labels = ax.get_legend_handles_labels()
-handles.append(Patch(facecolor='none', edgecolor='dimgray', hatch='///', label='Cloud cover ≥ 50%'))
-labels.append('Cloud cover ≥ 50%')
+if ice_fraction is None:
+    handles.append(Patch(facecolor='none', edgecolor='dimgray', hatch='///'))
+    labels.append('Cloud cover ≥ 50%')
+else:
+    for label, _low, _high, hatch, colour in PHASE_CLASSES:
+        handles.append(Patch(facecolor='none', edgecolor=colour, hatch=hatch))
+        labels.append(f'{label} (cover ≥ 50%)')
+    if no_water.any():
+        handles.append(Patch(facecolor='none', edgecolor='dimgray', hatch='\\\\'))
+        labels.append('Cloud cover ≥ 50%, no cloud water')
 if extinction_model is not None:
     handles.append(Line2D([0], [0], marker='s', linestyle='none', markersize=8, markerfacecolor='#ff9a5a',
                           markeredgecolor='dimgray'))

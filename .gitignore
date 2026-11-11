@@ -221,3 +221,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# GFS fields downloaded from AWS
+gfs_aws/

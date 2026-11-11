@@ -55,6 +55,12 @@ cloud above the observer and no `--cloud-base`, no rays are drawn and nothing is
 `--data-source` (GFS, ECMWF, HRRR, ...), `--aerosol` / `--aerosol-wavelength`, `--radar`, `--satellite`
 (FY-4B cloud mask and optical thickness strip), `--cth-method`, `--save`, `--silent`; see `-h`.
 
+`--data-source` is case-insensitive. `GFS` uses the Open-Meteo `gfs_seamless` blend. `GFS_AWS` downloads the plain
+GFS run from NOAA's public AWS bucket (only the needed GRIB2 fields, cached in `gfs_aws/`); that data has cloud
+liquid and ice water, so the figure shows the cloud phase (liquid / mixed / ice) and the light-ray transmittance
+uses it. With Open-Meteo data (all other sources, or `GFS_AWS` when the download fails) there is no cloud phase and
+the old temperature rule decides which cloud blocks light.
+
 ## E-mail service
 
 `email/` answers forecast requests sent by e-mail; see `email/README.md`. `email/config.toml` holds

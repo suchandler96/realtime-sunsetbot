@@ -34,6 +34,7 @@ class DataSource(str, Enum):
     """Model identifiers understood by the current backend."""
 
     GFS = "gfs_seamless"
+    GFS_AWS = "gfs_aws"   # not an Open-Meteo model: plain GFS from NOAA's AWS bucket (see gfs_aws.py)
     ECMWF = "ecmwf_ifs025"
     JMA_MSM = "jma_msm"
     CMA_GFS = "cma_grapes_global"
@@ -104,6 +105,8 @@ class OpenMeteoBackend(WeatherBackend):
         return [next(payloads) if ok else None for ok in inside]
 
     def _query(self, request: "WeatherRequest", latitudes, longitudes) -> "list[dict] | dict":
+        if any(v in ("cloud_liquid_water", "cloud_ice_water") for v in request._variables):
+            raise ValueError("Open-Meteo has no cloud liquid/ice water on pressure levels")
         params = {
             "latitude": ",".join(f"{lat:.4f}" for lat in latitudes),
             "longitude": ",".join(f"{lon:.4f}" for lon in longitudes),
@@ -168,6 +171,7 @@ class WeatherRequest:
         self._start_date: str | None = None
         self._end_date: str | None = None
         self._timezone = "UTC"
+        self._target_time: datetime | None = None   # moment of interest (aware); backends serving single runs use it
 
     # ----- data source -------------------------------------------------
     def source(self, source: DataSource) -> "WeatherRequest":
@@ -222,6 +226,10 @@ class WeatherRequest:
     def temperature(self) -> "WeatherRequest":
         return self.variables("temperature")
 
+    def cloud_water(self) -> "WeatherRequest":
+        """Cloud liquid and ice mixing ratios (kg/kg); only backends with native model output provide them."""
+        return self.variables("cloud_liquid_water", "cloud_ice_water")
+
     def geopotential_height(self) -> "WeatherRequest":
         """Height (m) of each pressure level; lets callers use true heights."""
         return self.variables("geopotential_height")
@@ -243,6 +251,11 @@ class WeatherRequest:
         """Request a single ISO date (overrides `forecast_days`)."""
         self._start_date = value
         self._end_date = value
+        return self
+
+    def valid_at(self, when: datetime) -> "WeatherRequest":
+        """The moment the profile is wanted for (timezone-aware)."""
+        self._target_time = when
         return self
 
     def timezone(self, tz: str) -> "WeatherRequest":
@@ -283,6 +296,7 @@ class WeatherResult:
         self.pressure_levels = list(request._pressure_levels)
         self.variables = list(request._variables)
         self.timezone = request._timezone
+        self.model_run = getattr(request._backend, "model_run", None)   # run init time (UTC), if the backend knows it
         first = next((p for p in point_payloads if p and p.get("hourly")), None)
         if first is None:
             raise RuntimeError("no valid point data returned by the backend")

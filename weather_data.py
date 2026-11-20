@@ -36,8 +36,9 @@ class DataSource(str, Enum):
     """Model identifiers understood by the current backend."""
 
     GFS = "gfs_seamless"
-    GFS_AWS = "gfs_aws"   # not an Open-Meteo model: plain GFS from NOAA's AWS bucket (see gfs_aws.py)
+    GFS_AWS = "gfs_aws"     # not an Open-Meteo model: plain GFS from NOAA's AWS bucket (see gfs_aws.py)
     ECMWF = "ecmwf_ifs025"
+    ICON = "icon_global"   # DWD ICON global: 0.125 deg grid (~13 km), the finest global model with pressure levels
     JMA_MSM = "jma_msm"
     CMA_GFS = "cma_grapes_global"
     HRRR = "ncep_hrrr_conus"
@@ -303,6 +304,9 @@ class WeatherRequest:
         # Validate variable/level configuration before handing off to a backend.
         self._expanded_hourly_variables()
 
+        direct = getattr(self._backend, "fetch_result", None)   # a backend may deliver the arrays itself
+        if direct is not None:
+            return direct(self)
         point_payloads = self._backend.fetch(self)
         return WeatherResult(point_payloads, self)
 
@@ -335,6 +339,24 @@ class WeatherResult:
         self._time_objects = [datetime.fromisoformat(value) for value in self.times]
         self._arrays: dict[str, np.ndarray] = {}
         self._parse(point_payloads)
+
+    @classmethod
+    def from_arrays(cls, request: WeatherRequest, times: list[str], arrays: dict[str, np.ndarray],
+                    elevation_km, model_run: datetime | None = None) -> "WeatherResult":
+        """A result built straight from (levels, points, times) arrays (local ISO `times`), without payload dicts."""
+        self = cls.__new__(cls)
+        self.source = request._source
+        self.latitudes = list(request._latitudes)
+        self.longitudes = list(request._longitudes)
+        self.pressure_levels = list(request._pressure_levels)
+        self.variables = list(request._variables)
+        self.timezone = request._timezone
+        self.model_run = model_run
+        self.times = list(times)
+        self.model_elevation_km = np.asarray(elevation_km, dtype=float)
+        self._time_objects = [datetime.fromisoformat(value) for value in self.times]
+        self._arrays = {name: np.asarray(arrays[name], dtype=float) for name in self.variables}
+        return self
 
     def _parse(self, point_payloads: list[dict | None]) -> None:
         time_count = len(self.times)

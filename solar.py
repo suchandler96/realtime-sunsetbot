@@ -187,16 +187,21 @@ def grazing_height(latitude: float, declination: float, r_earth: float, h: float
     return (r_earth + h) * math.sqrt(max(0.0, 1.0 - sin_theta * sin_theta)) - r_earth
 
 
+_COARSE_MINUTES = 15
+
+
 def sun_event(
     latitude: float,
     longitude: float,
     day: date | str,
     event: str,
     timezone_name: str = "Asia/Hong_Kong",
+    near: datetime | None = None,
 ) -> SunEvent:
     """Return the requested sunrise or sunset for a local calendar day.
 
-    `event` must be `"sunrise"` or `"sunset"`.
+    `event` must be `"sunrise"` or `"sunset"`.  `near` (optional) is the event time at a nearby place: the search
+    starts in a window of +-45 min around it and falls back to the whole day when the event is not found there.
     """
     if isinstance(day, str):
         day = date.fromisoformat(day)
@@ -209,45 +214,51 @@ def sun_event(
     start_utc = local_start.astimezone(timezone.utc)
     end_utc = start_utc + timedelta(days=1)
 
-    step = timedelta(minutes=1)
-    previous_time: datetime | None = None
-    previous_elevation: float | None = None
-    candidates: list[tuple[datetime, bool]] = []  # (crossing_utc, rising)
+    def elevation_at(moment: datetime) -> float:
+        return solar_position(latitude, longitude, moment).geometric_elevation
 
-    current = start_utc
-    while current <= end_utc:
-        geometric_elevation = solar_position(latitude, longitude, current).geometric_elevation
-        if previous_elevation is not None:
-            crosses = (
-                previous_elevation <= _SUN_RISE_SET_GEOMETRIC_ELEVATION
-                <= geometric_elevation
-            ) or (
-                previous_elevation >= _SUN_RISE_SET_GEOMETRIC_ELEVATION
-                >= geometric_elevation
-            )
-            if crosses:
-                span = geometric_elevation - previous_elevation
-                if span != 0:
-                    fraction = (_SUN_RISE_SET_GEOMETRIC_ELEVATION - previous_elevation) / span
-                else:
-                    fraction = 0.5
-                crossing = previous_time + (current - previous_time) * fraction
-                rising = geometric_elevation > previous_elevation
-                candidates.append((crossing, rising))
+    def crossed(before: float, after: float) -> bool:
+        limit = _SUN_RISE_SET_GEOMETRIC_ELEVATION
+        return before <= limit <= after or before >= limit >= after
 
-        previous_time = current
-        previous_elevation = geometric_elevation
-        current += step
-
+    # Coarse scan (every COARSE_MINUTES) finds the brackets that hold a crossing; only those are scanned minute by
+    # minute, so a day costs ~110 evaluations of the sun instead of 1441 (same result: the minute grid is the same).
+    coarse = timedelta(minutes=_COARSE_MINUTES)
     want_rising = event == "sunrise"
-    for crossing, rising in candidates:
-        if rising == want_rising:
-            position = solar_position(latitude, longitude, crossing)
-            return SunEvent(
-                event=event,
-                time=crossing.astimezone(tz),
-                time_utc=crossing,
-                position=position,
-            )
+
+    def scan(lo: datetime, hi: datetime) -> list[tuple[datetime, bool]]:
+        candidates: list[tuple[datetime, bool]] = []  # (crossing_utc, rising)
+        bracket_start, bracket_elevation = lo, elevation_at(lo)
+        while bracket_start < hi:
+            bracket_end = min(bracket_start + coarse, hi)
+            end_elevation = elevation_at(bracket_end)
+            if crossed(bracket_elevation, end_elevation):
+                previous_time, previous_elevation = bracket_start, bracket_elevation
+                current = bracket_start + timedelta(minutes=1)
+                while current <= bracket_end:
+                    geometric_elevation = elevation_at(current) if current < bracket_end else end_elevation
+                    if crossed(previous_elevation, geometric_elevation):
+                        span = geometric_elevation - previous_elevation
+                        fraction = (_SUN_RISE_SET_GEOMETRIC_ELEVATION - previous_elevation) / span if span != 0 else 0.5
+                        candidates.append((previous_time + (current - previous_time) * fraction,
+                                           geometric_elevation > previous_elevation))
+                    previous_time, previous_elevation = current, geometric_elevation
+                    current += timedelta(minutes=1)
+            bracket_start, bracket_elevation = bracket_end, end_elevation
+        return candidates
+
+    windows = []
+    if near is not None:
+        n = int((near - start_utc) / coarse)
+        lo = start_utc + max(n - 3, 0) * coarse
+        hi = min(start_utc + (n + 4) * coarse, end_utc)
+        if lo < hi:
+            windows.append((lo, hi))
+    windows.append((start_utc, end_utc))
+    for lo, hi in windows:
+        for crossing, rising in scan(lo, hi):
+            if rising == want_rising:
+                position = solar_position(latitude, longitude, crossing)
+                return SunEvent(event=event, time=crossing.astimezone(tz), time_utc=crossing, position=position)
 
     raise RuntimeError(f"could not determine {event} for {day} at lat={latitude}, lon={longitude}")

@@ -4,7 +4,7 @@ A vividness map needs thousands of profiles, but the free Open-Meteo API limits 
 (600 / minute, 5 000 / hour, 10 000 / day, see MINUTE_LIMIT below; a location costs max(1, variables / 10) calls,
 so a profile of 4 variables x 16 pressure levels is 6.4).  `PacedOpenMeteoBackend` is a drop-in `OpenMeteoBackend` that
 
-  * snaps the points to the model grid (GFS / ECMWF / CMA: 0.25 / 0.25 / 0.125 deg) and drops duplicates, since
+  * snaps the points to the model grid (GFS / ECMWF / ICON / CMA ...: weather_field.GRIDS) and drops duplicates, since
     neighbouring transects share model columns - the same grid cell is never paid for twice;
   * answers from an on-disk cache first (one gzip file per finished request in `om_cache/`), so an interrupted or
     quota-limited run is resumed by running the same command again, and a re-run costs nothing;
@@ -31,12 +31,12 @@ from datetime import date
 import requests
 
 from weather_data import DataSource, OpenMeteoBackend
+from weather_field import GRIDS
 
 DEFAULT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "om_cache")
 
-# Native grid spacing (deg) of models whose grid is aligned to multiples of it; query points are snapped to cell
-# centres.  Other models (JMA MSM, HRRR: finer, offset grids) are only rounded to 4 decimals.
-GRID_DEG: dict[DataSource, float] = {DataSource.GFS: 0.25, DataSource.ECMWF: 0.25, DataSource.CMA_GFS: 0.125}
+# Query points are snapped to the centres of the model's grid (see weather_field.GRIDS); models without a lat/lon grid
+# (HRRR) are only rounded to 4 decimals.
 
 # Free (non-commercial) tier limits, in weighted API calls; applied per IP address.
 # Source: https://open-meteo.com/en/pricing (comparison table) and https://open-meteo.com/en/terms ("Less than
@@ -173,9 +173,10 @@ class PacedOpenMeteoBackend(OpenMeteoBackend):
     # ----- keys -----
     @staticmethod
     def _snap(source: DataSource, lat: float, lon: float) -> tuple[float, float]:
-        step = GRID_DEG.get(source)
-        if step:
-            lat, lon = round(lat / step) * step, round(lon / step) * step
+        grid = GRIDS.get(source)
+        if grid:
+            lat = grid.lat0 + round((lat - grid.lat0) / grid.dlat) * grid.dlat
+            lon = grid.lon0 + round((lon - grid.lon0) / grid.dlon) * grid.dlon
         return round(lat, 4) + 0.0, round(lon, 4) + 0.0   # + 0.0: no "-0.0"
 
     @staticmethod

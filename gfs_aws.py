@@ -22,6 +22,7 @@ import requests
 import grib2
 from aerosol import _StatusLine, _rate, _size
 from weather_data import WeatherBackend
+from weather_field import Grid, GridField, decode
 
 BUCKET = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gfs_aws")
@@ -123,24 +124,27 @@ class GfsAwsBackend(WeatherBackend):
         self.model_run: datetime | None = None   # init time (UTC) of the run actually used
         self.forecast_hour: int | None = None
 
+    def load(self, valid: datetime, variables, pressure_levels):
+        """Download (or read from the cache) the fields of the forecast hour nearest to `valid`: returns
+        ({(GRIB name, level): Grib2Field}, valid time of the forecast hour in UTC).  Sets `model_run`."""
+        unknown = [v for v in variables if v not in VARIABLES]
+        if unknown:
+            raise ValueError(f"AWS GFS backend has no variable {', '.join(unknown)}")
+        valid = valid.astimezone(timezone.utc)
+        run, hour, rows = find_run(valid)
+        self.model_run, self.forecast_hour = run, hour
+
+        wanted = {(VARIABLES[v][0], f"{level} mb") for v in variables for level in pressure_levels}
+        wanted.add(("HGT", "surface"))     # the model's own terrain height
+        ranges = _ranges(rows, wanted)
+        if len(set(wanted) - set(ranges)) == len(wanted):
+            raise RuntimeError("the .idx file lists none of the wanted fields")
+        return self._download(run, hour, ranges), run + timedelta(hours=hour)
+
     def fetch(self, request) -> list[dict | None]:
         if request._target_time is None:
             raise ValueError("the AWS GFS backend needs the target time: call valid_at() first")
-        unknown = [v for v in request._variables if v not in VARIABLES]
-        if unknown:
-            raise ValueError(f"AWS GFS backend has no variable {', '.join(unknown)}")
-        valid = request._target_time.astimezone(timezone.utc)
-        run, hour, rows = find_run(valid)
-        self.model_run, self.forecast_hour = run, hour
-        valid_model = run + timedelta(hours=hour)
-
-        wanted = {(VARIABLES[v][0], f"{level} mb") for v in request._variables for level in request._pressure_levels}
-        wanted.add(("HGT", "surface"))     # the model's own terrain height
-        ranges = _ranges(rows, wanted)
-        missing = wanted - set(ranges)
-        if len(missing) == len(wanted):
-            raise RuntimeError("the .idx file lists none of the wanted fields")
-        fields = self._download(run, hour, ranges)
+        fields, valid_model = self.load(request._target_time, request._variables, request._pressure_levels)
 
         lats = np.asarray(request._latitudes, dtype=float)
         lons = np.asarray(request._longitudes, dtype=float)
@@ -204,6 +208,46 @@ class GfsAwsBackend(WeatherBackend):
         elapsed = time.time() - started
         print(f"{label}: {len(ranges)} fields from AWS, {_size(state['bytes'])} {_unit(state['bytes'])} downloaded in {elapsed:.0f} s")
         return fields
+
+
+class GfsAwsProvider:
+    """The GFS grid cells a map needs for one UTC hour, as a `weather_field.GridField` (plain global GFS, with cloud
+    liquid / ice water).  The whole fields are downloaded (one forecast hour = ~50 MB, whatever the area); only the
+    cells asked for are kept."""
+
+    cloud_water = True
+    grid = Grid(0.25, 0.25)
+
+    def __init__(self, variables, pressure_levels):
+        self.backend = GfsAwsBackend()
+        self.variables = list(variables) + ["cloud_liquid_water", "cloud_ice_water"]
+        self.levels = list(pressure_levels)
+
+    @property
+    def model_run(self):
+        return self.backend.model_run
+
+    def field(self, hour: datetime, keys) -> GridField:
+        fields, valid = self.backend.load(hour, self.variables, self.levels)
+        ci, cj = decode(keys)
+
+        def cells(field: grib2.Grib2Field) -> np.ndarray:
+            n_lat, n_lon = field.values.shape
+            lat, lon = self.grid.centre(ci, cj)
+            rows = np.rint((lat - field.lat0) / field.dlat).astype(int)
+            cols = np.rint((lon - field.lon0) / field.dlon).astype(int) % n_lon
+            ok = (rows >= 0) & (rows < n_lat)
+            return np.where(ok, field.values[np.clip(rows, 0, n_lat - 1), cols], np.nan)
+
+        data = {}
+        for variable in self.variables:
+            name, convert = VARIABLES[variable]
+            levels = [fields.get((name, f"{level} mb")) for level in self.levels]
+            data[variable] = np.stack([np.full(len(keys), np.nan) if f is None else convert(cells(f))
+                                       for f in levels])[:, :, None]
+        surface = fields.get(("HGT", "surface"))
+        elevation = np.full(len(keys), np.nan) if surface is None else cells(surface)
+        return GridField(self.grid, keys, data, elevation, self.levels, [valid], self.backend.model_run)
 
 
 def _sample(field: grib2.Grib2Field, lats, lons) -> np.ndarray:

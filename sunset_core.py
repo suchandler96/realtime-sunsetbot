@@ -46,9 +46,9 @@ CLOUD_BASE_COVER_MIN = 50.0   # ... and so does one with at least this cloud cov
 
 # Model initialisation time estimate (UTC cycle) when the real run time is unknown.
 MODEL_CYCLE_HOURS = {DataSource.GFS: 6, DataSource.GFS_AWS: 6, DataSource.ECMWF: 12, DataSource.JMA_MSM: 3,
-                     DataSource.CMA_GFS: 6, DataSource.HRRR: 1}
+                     DataSource.CMA_GFS: 6, DataSource.HRRR: 1, DataSource.ICON: 6}
 MODEL_RUN_DELAY_HOURS = {DataSource.GFS: 5, DataSource.GFS_AWS: 4, DataSource.ECMWF: 9, DataSource.JMA_MSM: 2,
-                         DataSource.CMA_GFS: 6, DataSource.HRRR: 2}
+                         DataSource.CMA_GFS: 6, DataSource.HRRR: 2, DataSource.ICON: 4}
 # Open-Meteo publishes the real run time per dataset (gfs_seamless is a blend; use the global GFS).
 META_DATASET = {DataSource.GFS: "ncep_gfs013", DataSource.GFS_AWS: "ncep_gfs013"}
 
@@ -165,6 +165,9 @@ def model_run_label(source: DataSource, weather: WeatherResult | None = None) ->
 
 
 # ==================== weather ====================
+PROFILE_VARIABLES = ("relative_humidity", "cloud_cover", "temperature", "geopotential_height")   # per pressure level
+
+
 def request_profile(source: DataSource, lats, lons, date: str, tz: str, valid_at, backend=None,
                     cloud_water: bool = False) -> WeatherResult:
     """One pressure-level request for any number of points (a single transect or a batch of them)."""
@@ -172,10 +175,7 @@ def request_profile(source: DataSource, lats, lons, date: str, tz: str, valid_at
         WeatherData.source(source, backend=backend)
         .coordinates(lats, lons)
         .pressure_levels(PRESSURE_LEVELS)
-        .relative_humidity()
-        .cloud_cover()
-        .temperature()
-        .geopotential_height()
+        .variables(*PROFILE_VARIABLES)
         .timezone(tz)
         .on(date)
         .valid_at(valid_at)
@@ -216,17 +216,21 @@ def fetch_weather_batch(transects: list[Transect], source: DataSource, valid_at=
     if weather.model_run is not None:   # the run really used, not an estimate
         log(f"GFS from AWS: run {weather.model_run:%Y-%m-%d %Hz} (plain global GFS, with cloud liquid/ice water)")
 
-    # Some models lack some pressure levels (e.g. ECMWF: 975/950/900/800 hPa); fill them by interpolation.
+    return split_weather(weather, transects, source, log), source
+
+
+def split_weather(weather: WeatherResult, transects: list[Transect], source: DataSource, log=print) -> list[WeatherResult]:
+    """One `WeatherResult` per transect out of a batch result (the transects' points, in order).  Some models lack
+    some pressure levels (e.g. ECMWF: 975/950/900/800 hPa); those are filled by interpolation first."""
     filled_levels = weather.fill_missing_levels()
     if filled_levels:
         log(f"Interpolated pressure levels missing in {source.value}: "
             + ", ".join(f"{p} hPa" for p in filled_levels))
-
     results, start = [], 0
     for t in transects:
         results.append(weather.subset(slice(start, start + len(t.lats))))
         start += len(t.lats)
-    return results, source
+    return results
 
 
 # ==================== profile ====================

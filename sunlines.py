@@ -9,9 +9,12 @@ Layout
   * Lines start on the edges of the region that face the sun (an edge is a start edge when the sun direction at its
     middle points into the region), one line every `cross_km` measured across the sun direction.  Each line follows
     the sun azimuth of its start point, so the lines are "rotated" with the sun and bend with it over the region.
-  * Observers sit every `along_km` along a line until it leaves the region.  `along_km` must be a multiple of the
-    column step (sunset_core.STEP_KM), so that every observer falls on a column of the shared transect and the
-    weather slices are exact.  (The shared terrain is read on a finer grid, see `vividness_map._SharedTerrain`.)
+  * Observers sit every `along_km` (a whole number of km) along a line until it leaves the region.  The shared
+    transect has columns every `column_step_km(along_km)`: the largest step that divides both `along_km` and the
+    column step of an observer's own transect (sunset_core.STEP_KM, 20 km), so that every observer falls on a
+    column and its own columns (every 20 km from there) are among the shared ones: the weather slices are exact.
+    For `along_km` a multiple of 20 that is simply 20 km; at 5 km the shared columns are 5 km apart and each
+    observer takes every fourth one.  (The shared terrain is read on a finer grid, see `vividness_map._SharedTerrain`.)
   * A group of consecutive observers shares one transect while (a) they lie within `share_km` of the group's first
     observer (the azimuth drifts over distance, so the sharing range is limited) and (b), for single-time weather
     (AWS GFS: one forecast hour per request), their events fall into the same forecast hour; weather of different
@@ -106,15 +109,22 @@ def start_points(bbox, cross_km: float, azimuth_at) -> list[tuple[float, float]]
 
 
 # ==================== lines and groups ====================
-def _observer(lat, lon, day, event, tz, line, along_km, offset_km, cache) -> Observer:
+def _observer(lat, lon, day, event, tz, line, along_km, offset_km, cache, near=None) -> Observer:
     key = (round(lat, 6), round(lon, 6))
     sun = cache.get(key)
     if sun is None:
-        sun = cache[key] = sun_event(lat, lon, day, event, tz)
+        sun = cache[key] = sun_event(lat, lon, day, event, tz, near=near)   # `near`: a neighbour's event time
     return Observer(lat, lon, sun, line, along_km, offset_km)
 
 
-def _make_group(members: list[Observer], day, event, tz, x_max, single_time) -> Group:
+def column_step_km(along_km: float) -> float:
+    """Spacing (km) of the columns of a shared transect for observers `along_km` apart (see the module docstring)."""
+    if along_km <= 0 or along_km != int(along_km):
+        raise ValueError(f"along_km must be a positive whole number of km, got {along_km}")
+    return float(math.gcd(int(along_km), int(core.STEP_KM)))
+
+
+def _make_group(members: list[Observer], day, event, tz, x_max, single_time, along_km: float) -> Group:
     """One transect from the first member through all of them, laid in the direction of the sun azimuth of the
     middle member (of the two middle ones, averaged, for an even count), so that the azimuth drift to either end of
     the group is as small as it can be.  The members then stand on the columns of this final line."""
@@ -123,10 +133,11 @@ def _make_group(members: list[Observer], day, event, tz, x_max, single_time) -> 
                      + members[len(members) // 2].sun.position.azimuth)
     city = PointCity(f"{first.lat:.2f},{first.lon:.2f}", first.lat, first.lon, tz)
     length = members[-1].offset_km + x_max
-    transect = core.make_transect(city, day, event, x_min=0, x_max=length, step_km=core.STEP_KM, sun=first.sun,
+    step = column_step_km(along_km)
+    transect = core.make_transect(city, day, event, x_min=0, x_max=length, step_km=step, sun=first.sun,
                                   azimuth=azimuth)
     for member in members:
-        column = int(round(member.offset_km / core.STEP_KM))
+        column = int(round(member.offset_km / step))
         member.lat, member.lon = transect.lats[column], transect.lons[column]
     return Group(transect, members, snapshot_hour(first.sun.time) if single_time else None)
 
@@ -138,16 +149,18 @@ def _collect(start: Observer, bbox, day, event, tz, line, along_km, share_km, si
     members = [start]
     r_earth = core.earth_radius_km(start.lat)
     azimuth = start.sun.position.azimuth
+    near = start.sun.time_utc
     for k in range(1, int(2.5 * 20000 / along_km)):          # the bound only guards against a line that never ends
         offset = k * along_km
         lat, lon = core.get_point_at_distance(start.lat, start.lon, offset, azimuth, r_earth)
         if not _inside(lat, lon, bbox):
             return members, None
         try:
-            candidate = _observer(lat, lon, day, event, tz, line, start.along_km + offset, offset, cache)
+            candidate = _observer(lat, lon, day, event, tz, line, start.along_km + offset, offset, cache, near)
         except Exception as exc:
             log(f"line {line} ends at ({lat:.2f}, {lon:.2f}): {exc}")
             return members, None
+        near = candidate.sun.time_utc
         same_snapshot = (not single_time) or snapshot_hour(candidate.sun.time) == snapshot_hour(start.sun.time)
         if offset <= share_km and same_snapshot:
             members.append(candidate)
@@ -168,7 +181,7 @@ def march_line(start, line: int, bbox, day: str, event: str, tz: str, along_km: 
     groups: list[Group] = []
     while first is not None and len(groups) < int(2.5 * 20000 / along_km):
         members, following = _collect(first, bbox, day, event, tz, line, along_km, share_km, single_time, cache, log)
-        group = _make_group(members, day, event, tz, x_max, single_time)
+        group = _make_group(members, day, event, tz, x_max, single_time, along_km)
         groups.append(group)
         if following is not None:   # continue where the final line puts the next observer
             following.lat, following.lon = core.get_point_at_distance(
@@ -181,9 +194,7 @@ def build_layout(bbox, day: str, event: str, tz: str, cross_km: float = 20.0, al
                  share_km: float = 100.0, x_max: float = core.X_MAX, single_time: bool = True,
                  log=print) -> list[Group]:
     """All sun lines of a region as groups of observers; see the module docstring."""
-    if along_km <= 0 or along_km % core.STEP_KM:
-        raise ValueError(f"along_km must be a positive multiple of {core.STEP_KM} km (the step of the model columns "
-                         f"of a shared transect), got {along_km}")
+    column_step_km(along_km)    # validates along_km
     if cross_km <= 0 or share_km < 0:
         raise ValueError("cross_km must be positive and share_km not negative")
     cache: dict = {}

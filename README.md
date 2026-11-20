@@ -52,13 +52,13 @@ cloud above the observer and no `--cloud-base`, no rays are drawn and nothing is
 
 ## Other options
 
-`--data-source` (GFS, ECMWF, HRRR, ...), `--aerosol` / `--aerosol-wavelength`, `--radar`, `--satellite`
+`--data-source` (GFS, ECMWF, ICON, HRRR, ...), `--aerosol` / `--aerosol-wavelength`, `--radar`, `--satellite`
 (FY-4B cloud mask and optical thickness strip), `--cth-method`, `--save`, `--silent`; see `-h`.
 
 `--data-source` is case-insensitive. `GFS` uses the Open-Meteo `gfs_seamless` blend. `GFS_AWS` downloads the plain
 GFS run from NOAA's public AWS bucket (only the needed GRIB2 fields, cached in `gfs_aws/`); that data has cloud
 liquid and ice water, so the figure shows the cloud phase (liquid / mixed / ice) and the light-ray transmittance
-uses it. With Open-Meteo data (all other sources, or `GFS_AWS` when the download fails) there is no cloud phase and
+uses it. `ICON` is DWD's global model on Open-Meteo (0.125° grid, 16 pressure levels). With Open-Meteo data (all other sources, or `GFS_AWS` when the download fails) there is no cloud phase and
 the old temperature rule decides which cloud blocks light.
 
 ## Code layout
@@ -78,7 +78,7 @@ result on an `images/base_*.png` radar base map:
 python vividness_map.py --region AECN --event sunset --date 2026-11-12 --data-source GFS_AWS --save
 ```
 
-A point's score = local cloud cover x best 3-minute sliding mean (rays 0.5 min apart) of ray brightness
+A point's score = local cloud cover x best 6-minute sliding mean (`--window-min`) (rays 0.5 min apart) of ray brightness
 (green transmittance, logarithmic) x ray colour (red/blue transmittance); the thresholds are constants at the top of
 the file. It says how well the cloud base over each point is lit; there is no smoothing over neighbouring points.
 An observer with no level reaching the `CLOUD_PRESENT_*` constants (cloud cover / relative humidity) is skipped
@@ -87,8 +87,8 @@ thresholds.
 
 **Layout (`--layout`).** The default, `sunlines`, puts the observers on lines that follow the sun azimuth, so that
 neighbours share one cross-section (`sunlines.py` describes it in detail):
-lines start on the region's sun-facing edges every `--cross-km` (20), observers sit every `--along-km` (20, a
-multiple of the 20 km model-column step) along each line, and observers within `--share-km` (100) of a group's
+lines start on the region's sun-facing edges every `--grid-size` km (20), observers sit every `--grid-size` km (a whole number; the
+shared columns are `gcd(grid size, 20 km)` apart, each observer uses every 20 km one) along each line, and observers within `--share-km` (100) of a group's
 first observer use that observer's cross-section: weather and terrain are fetched once and each observer takes the
 slice from its own position (terrain is read on a 1 km grid, so the slices are exact). A group never mixes two
 forecast hours (AWS GFS gives one hour per request). The azimuth drifts with distance, so sharing is an
@@ -99,11 +99,21 @@ on either side of a ray). On AECN at the defaults, 6900 observers need 5.0x fewe
 columns than one cross-section each (about 3 min in total, of which the sun-event calculation for every observer
 takes about 80 s).
 The cells are drawn rotated to the azimuth; where neighbouring lines converge they overlap (the higher score on top)
-and where they diverge there are gaps. `--layout grid` is the older lat/lon grid (`--step-deg`), one cross-section
+and where they diverge there are gaps. `--layout grid` is the older lat/lon grid (cells of `--grid-size` km), one cross-section
 per point.
 
-`--save` also writes the scores to a `.npz` that `--from-npz` redraws. Use `GFS_AWS`
-for maps: Open-Meteo rate-limits big batches.
+**Weather data, hour by hour.** The map downloads the model's grid cells first and samples them afterwards.
+For each UTC hour of the observers' events it loads the cells its transects need (`weather_field.GridField`), then
+reads them at the transects' points: `--sampling nearest` takes the closest cell, `--sampling bilinear` (default)
+blends the four around the point. What is downloaded depends only on the model grid and the area, not on the map's
+resolution (`--grid-size`, in km, for both layouts), so a finer map costs no
+extra download. With `--overlap` (default) the next hour is downloaded while the current one is being computed
+(`--no-overlap`: one after the other, same result). Open-Meteo models are downloaded through the quota-paced
+`openmeteo_paced.py` (cells are cached in `om_cache/`, a run that hits the daily quota resumes next time;
+`--om-plan-only` prints the estimate); a cell is paid for once whichever hours use it. Use `GFS_AWS` for the biggest
+maps: it has no quota.
+
+`--save` also writes the scores to a `.npz` that `--from-npz` redraws.
 
 ## E-mail service
 

@@ -92,12 +92,17 @@ class ProfileExtinction:
     heights_km: (levels, points) heights of the cloud-cover and temperature fields.
     aerosol_*: optional CAMS extinction (levels, points) at `wavelength_nm` with its own heights (levels, points).
     liquid_extinction / ice_extinction: optional in-cloud extinction (levels, points, km^-1) of cloud liquid and ice
-    from `condensate_extinction`; with them the cloud phase is not guessed from temperature."""
+    from `condensate_extinction`; with them the cloud phase is not guessed from temperature.
+    r_earth_km: local Earth radius.  x is the arc distance on the ground and y the height, so the true length of a
+    ray element is sqrt(dy^2 + ((R + y) / R)^2 dx^2) (the arc is longer at height); without a radius the flat
+    hypot(dx, dy) is used."""
 
     def __init__(self, distances, heights_km, cloud_cover, temperature=None, underground=None,
                  aerosol_extinction=None, aerosol_heights_km=None, wavelength_nm=532,
                  cloud_block_cover_percent=DEFAULT_CLOUD_BLOCK_COVER_PERCENT,
-                 ice_extinction_per_km=ICE_EXTINCTION_PER_KM, liquid_extinction=None, ice_extinction=None):
+                 ice_extinction_per_km=ICE_EXTINCTION_PER_KM, liquid_extinction=None, ice_extinction=None,
+                 r_earth_km=None):
+        self.r_earth_km = None if r_earth_km is None else float(r_earth_km)
         self.distances = np.asarray(distances, dtype=float)
         cloud = np.clip(np.nan_to_num(cloud_cover, nan=0.0), 0.0, 100.0)
         if underground is not None:  # extrapolated data below the model terrain is not real cloud
@@ -118,6 +123,14 @@ class ProfileExtinction:
         wavelengths = np.asarray(RGB_NM)
         self._aerosol_scale = (wavelength_nm / wavelengths) ** AEROSOL_ANGSTROM
         self._rayleigh_scale = rayleigh_sea_level_per_km(wavelengths)
+
+    def step_length(self, dx, y0, y1):
+        """Length (km) of ray elements from (x, y0) to (x + dx, y1) in the (arc distance, height) frame."""
+        dy = np.asarray(y1) - np.asarray(y0)
+        if self.r_earth_km is None:
+            return np.hypot(dx, dy)
+        scale = 1.0 + 0.5 * (np.asarray(y0) + np.asarray(y1)) / self.r_earth_km
+        return np.sqrt(dy * dy + (scale * dx) ** 2)
 
     @staticmethod
     def _columns(heights, values):
@@ -210,7 +223,7 @@ class ProfileExtinction:
             if ys[i] > top_km:
                 break
             cur = at(i)
-            ds = np.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1])
+            ds = float(self.step_length(xs[i] - xs[i - 1], ys[i - 1], ys[i]))
             tau_cloud += 0.5 * (prev[0] + cur[0]) * ds
             tau_aerosol += 0.5 * (prev[2] + cur[2]) * ds
             tau_rayleigh += 0.5 * (prev[3] + cur[3]) * ds
@@ -277,7 +290,7 @@ class ProfileExtinction:
         rayleigh = np.exp(-np.maximum(ys, 0.0) / RAYLEIGH_SCALE_HEIGHT_KM)[..., None] * self._rayleigh_scale
 
         # trapezoid optical depth up to every sample (index k = the step ending at sample k + 1)
-        ds = np.hypot(np.diff(xs)[None, :], np.diff(ys, axis=1))
+        ds = self.step_length(np.diff(xs)[None, :], ys[:, :-1], ys[:, 1:])
         cum_cloud = np.cumsum(0.5 * (ice_beta[:, :-1] + ice_beta[:, 1:]) * ds, axis=1)
         cum_aerosol = np.cumsum(0.5 * (aerosol[:, :-1] + aerosol[:, 1:]) * ds[..., None], axis=1)
         cum_rayleigh = np.cumsum(0.5 * (rayleigh[:, :-1] + rayleigh[:, 1:]) * ds[..., None], axis=1)

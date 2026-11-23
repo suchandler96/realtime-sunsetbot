@@ -521,6 +521,7 @@ def trace_rays(profile: Profile, aerosol_profile=None, aerosol_height_km=None, a
     if transmittance:
         extinction_model = raytrace.ProfileExtinction(
             distances, profile.height_km, profile.cloud, profile.temp, underground=profile.underground,
+            r_earth_km=t.r_earth,
             aerosol_extinction=None if aerosol_profile is None else aerosol_profile.extinction_per_km,
             aerosol_heights_km=aerosol_height_km, wavelength_nm=aerosol_wavelength,
             **(dict(zip(("liquid_extinction", "ice_extinction"), raytrace.condensate_extinction(

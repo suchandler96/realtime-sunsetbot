@@ -156,10 +156,12 @@ class ProfileExtinction:
         return float(np.interp(y, heights, values, left=0.0, right=0.0))
 
     def _target_cell_exit(self, x):
-        """Right-hand boundary of the horizontal model cell containing the ray endpoint."""
+        """Right-hand boundary of the ignored region: one sampling distance d beyond the column nearest the ray
+        endpoint, i.e. clouds within [-d, +d] of that column are ignored."""
         midpoints = 0.5 * (self.distances[:-1] + self.distances[1:])
-        j = int(np.searchsorted(midpoints, x, side="right"))
-        return float(midpoints[j]) if j < len(midpoints) else float(self.distances[-1])
+        j = int(np.searchsorted(midpoints, x, side="right"))   # nearest column
+        d = float(self.distances[1] - self.distances[0]) if len(self.distances) > 1 else 0.0
+        return min(float(self.distances[j]) + d, float(self.distances[-1]))
 
     def extinction(self, x, y):
         """Fields at one point as (cloud cover percent, temperature C, aerosol[rgb], Rayleigh[rgb])."""
